@@ -2,7 +2,6 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, coint
 import itertools
-from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
 
@@ -56,7 +55,7 @@ def fetch_coint_pairs(sector_map, spot_folder, start_time, end_time, max_workers
 
         with Pool(num_workers) as pool:
             fn = partial(process_pair, spot_folder = spot_folder, start_time = str(start_time), end_time = str(end_time))
-            results = list(tqdm(pool.imap(fn, pairs), total = num_pairs))
+            results = list(pool.imap(fn, pairs))
 
         for pair_info in results:
             if pair_info is not None:
