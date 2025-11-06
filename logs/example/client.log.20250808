@@ -1,0 +1,7 @@
+[2025-08-08 14:15:32.823920600 +08:00 INFO] [login] personal_id="D122982701"
+[2025-08-08 14:15:32.865656100 +08:00 INFO] this account require 2fa
+[2025-08-08 14:15:32.913061800 +08:00 INFO] [future_option_mapping]: 32.5858ms
+[2025-08-08 14:15:32.924975400 +08:00 INFO] [future_option_mapping]: 10.4793ms
+[2025-08-08 14:15:32.977518900 +08:00 INFO] [future_option_mapping]: 51.8932ms
+[2025-08-08 14:15:33.002405 +08:00 INFO] [future_option_mapping]: 19.4388ms
+[2025-08-08 14:20:36.736625 +08:00 INFO] [order_history] account=Account { branch_no: "20201", account: "345161", account_type: "stock", name: "陳信全" }, date=20240313, date1=Some("20240313")
