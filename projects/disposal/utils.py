@@ -57,11 +57,24 @@ def fetch_and_filter_price(client, stock_id, event_dates, offset_days=3):
 def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     """
     使用多執行緒平行抓取所有股票的價格資料。
+    支援 Finlab 資料格式 (自動偵測 '處置開始時間' 欄位)。
     """
     disposal_events = disposal_info.copy()
-    unique_stocks = disposal_events['stock_id'].unique()
+    
+    # 偵測是否為 Finlab 資料格式
+    is_finlab = '處置開始時間' in disposal_events.columns
+    
+    if is_finlab:
+        # 使用 'stock_id' 和 '處置開始時間'
+        unique_stocks = disposal_events['stock_id'].unique()
+        date_col = '處置開始時間'
+    else:
+        # 舊有邏輯
+        unique_stocks = disposal_events['stock_id'].unique()
+        date_col = 'date'
     
     print(f"Starting batch fetch for {len(unique_stocks)} stocks with {max_workers} workers...")
+    print(f"Using date column: {date_col}")
     
     all_prices = []
     
@@ -69,7 +82,10 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
         # 提交任務
         future_to_stock = {}
         for stock_id in unique_stocks:
-            stock_dates = disposal_events[disposal_events['stock_id'] == stock_id]['date']
+            stock_dates = disposal_events[disposal_events['stock_id'] == stock_id][date_col]
+            # 確保日期格式正確
+            stock_dates = pd.to_datetime(stock_dates)
+            
             future = executor.submit(fetch_and_filter_price, client, stock_id, stock_dates, offset_days)
             future_to_stock[future] = stock_id
             
@@ -95,10 +111,10 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
 def run_event_study(price_df, disposal_info, offset_days=3):
     """
     執行事件研究分析：
-    1. 判定處置起始日 (Event Definition)
+    1. 判定處置起始日 (Event Definition) - 支援 Finlab 直接指定
     2. 計算交易日索引 (Trading Index)
     3. 計算假日間隔 (Gap Days)
-    4. 計算相對天數 (Relative Days) 與正規化 (Normalization)
+    4. 計算相對天數 (Relative Days)
     """
     if price_df.empty:
         print("Price DataFrame is empty.")
@@ -119,17 +135,41 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     prices['gap_days'] = prices['trade_date_diff'].fillna(1) - 1
     
     # 2. 準備事件表 (Start Date Detection)
-    events = disposal_info[['stock_id', 'date']].sort_values(['stock_id', 'date'])
-    events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_date'})
-    events['event_date'] = pd.to_datetime(events['event_date'])
+    # 判斷是否為 Finlab 資料
+    if '處置開始時間' in disposal_info.columns:
+        print("Detected Finlab data format. Using '處置開始時間' as event start.")
+        # [Modified] Added '處置條件'
+        events = disposal_info[['stock_id', '處置開始時間', '分時交易', '處置條件']].copy()
+        events = events.rename(columns={
+            'stock_id': 'Stock_id', 
+            '處置開始時間': 'event_date',
+            '分時交易': 'interval',
+            '處置條件': 'condition'
+        })
+        
+        # [Modified] Simplify condition text
+        if 'condition' in events.columns:
+            events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
+            
+        # 處置開始時間可能是 start date, 不需再運算
+        start_events = events.copy()
+        start_events['event_date'] = pd.to_datetime(start_events['event_date'])
+        # 去除重複
+        start_events = start_events.drop_duplicates(subset=['Stock_id', 'event_date'])
+        
+    else:
+        print("Using legacy logic (calculating start date from continuous periods).")
+        events = disposal_info[['stock_id', 'date']].sort_values(['stock_id', 'date'])
+        events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_date'})
+        events['event_date'] = pd.to_datetime(events['event_date'])
+        
+        # 找出連續期間的起始日
+        events['prev_date'] = events.groupby('Stock_id')['event_date'].shift(1)
+        events['days_diff'] = (events['event_date'] - events['prev_date']).dt.days
+        is_start = events['days_diff'].isna() | (events['days_diff'] > 1)
+        start_events = events[is_start][['Stock_id', 'event_date']].copy()
     
-    # 找出連續期間的起始日
-    events['prev_date'] = events.groupby('Stock_id')['event_date'].shift(1)
-    events['days_diff'] = (events['event_date'] - events['prev_date']).dt.days
-    is_start = events['days_diff'].isna() | (events['days_diff'] > 1)
-    start_events = events[is_start][['Stock_id', 'event_date']].copy()
-    
-    print(f"Original events: {len(events)}, Consolidated Start Events: {len(start_events)}")
+    print(f"Consolidated Start Events: {len(start_events)}")
     
     # 3. 找出事件日對應的交易日索引
     event_indices = pd.merge(
@@ -138,7 +178,16 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         left_on=['Stock_id', 'event_date'], 
         right_on=['Stock_id', 'Date'], 
         how='inner'
-    )[['Stock_id', 'event_date', 'trading_idx']].rename(columns={'trading_idx': 'event_idx'})
+    )
+    
+    # [Modified] Dynamic column selection for retention
+    cols_to_keep = ['Stock_id', 'event_date', 'trading_idx']
+    if 'condition' in start_events.columns:
+        cols_to_keep.append('condition')
+    if 'interval' in start_events.columns:
+        cols_to_keep.append('interval')
+        
+    event_indices = event_indices[cols_to_keep].rename(columns={'trading_idx': 'event_idx'})
     
     # 4. 合併股價與事件索引
     merged = pd.merge(prices, event_indices, on='Stock_id', how='inner')
@@ -160,15 +209,24 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         else: return 't+0'
     event_study_df['t_label'] = event_study_df['relative_day'].apply(format_t)
     
-    # 9. 正規化 (Normalization)
-    # 以 t-1 (relative_day == -1) 為基準
-    base_prices = event_study_df[event_study_df['relative_day'] == -1][['Stock_id', 'event_date', 'Close', 'Volume']]
-    
-    event_study_df = pd.merge(event_study_df, base_prices, on=['Stock_id', 'event_date'], how='left')
+    # 9. 正規化 (Normalization) - 已移除
+    pass
     
     # 10. 整理欄位
-    cols = ['Date', 'Stock_id', 't_label', 'relative_day', 'gap_days', 'calendar_relative_day', 'Open', 'High', 'Low', 'Close', 'Volume']
+    base_cols = ['Date', 'Stock_id', 't_label', 'relative_day', 'gap_days', 'calendar_relative_day']
+    price_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    
+    cols = list(base_cols)
+    # Add condition and interval before price columns
+    if 'condition' in event_study_df.columns:
+        cols.append('condition')
+    if 'interval' in event_study_df.columns:
+        cols.append('interval')
+        
+    cols.extend(price_cols)
+    
     final_df = event_study_df[cols].sort_values(['Stock_id', 'Date'])
+    final_df['daily_ret'] = (final_df['Close']/final_df['Open']) - 1
     
     print(f"Analysis completed. Result shape: {final_df.shape}")
     return final_df
