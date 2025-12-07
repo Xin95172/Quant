@@ -54,13 +54,32 @@ def fetch_and_filter_price(client, stock_id, event_dates, offset_days=3):
         print(f"Error fetching {stock_id}: {e}")
         return None
 
+# Add explicit import inside function or global import if possible
+# But to avoid circular imports if this module is imported by others, better to import inside.
+# However, standard practice is top-level. Let's add top-level import for FinMindClient via string or pass the class?
+# Easier: Just import it inside the function or assume access.
+# Let's add the import at the top of the file first in another step? 
+# OR: We can use the existing client to get the token, and make new clients.
+
+def _fetch_worker(stock_id, dates, offset_days, token=None):
+    from module.get_info_FinMind import FinMindClient
+    # Create a new local client for thread safety
+    local_client = FinMindClient()
+    if token:
+        local_client.login_by_token(token)
+    return fetch_and_filter_price(local_client, stock_id, dates, offset_days)
+
 def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     """
     使用多執行緒平行抓取所有股票的價格資料。
     支援 Finlab 資料格式 (自動偵測 '處置開始時間' 欄位)。
+    [Safety Fix] Create independent clients for each thread to avoid race conditions.
     """
     disposal_events = disposal_info.copy()
     
+    # Extract token from the passed client to reuse
+    token = client.config.api_token if hasattr(client, 'config') else None
+
     # 偵測是否為 Finlab 資料格式
     is_finlab = '處置開始時間' in disposal_events.columns
     
@@ -86,7 +105,8 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
             # 確保日期格式正確
             stock_dates = pd.to_datetime(stock_dates)
             
-            future = executor.submit(fetch_and_filter_price, client, stock_id, stock_dates, offset_days)
+            # [Fix] Use _fetch_worker to instantiate new client per thread
+            future = executor.submit(_fetch_worker, stock_id, stock_dates, offset_days, token)
             future_to_stock[future] = stock_id
             
         # 處理結果 (顯示進度條)
@@ -119,9 +139,7 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     if price_df.empty:
         print("Price DataFrame is empty.")
         return pd.DataFrame()
-        
-    print("Running Event Study Analysis...")
-    
+            
     # 1. 準備股價表
     prices = price_df.sort_values(['Stock_id', 'Date']).copy()
     prices['Date'] = pd.to_datetime(prices['Date'])
@@ -137,8 +155,6 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # 2. 準備事件表 (Start Date Detection)
     # 判斷是否為 Finlab 資料
     if '處置開始時間' in disposal_info.columns:
-        print("Detected Finlab data format. Using '處置開始時間' as event start.")
-        # [Modified] Added '處置條件'
         events = disposal_info[['stock_id', '處置開始時間', '分時交易', '處置條件']].copy()
         events = events.rename(columns={
             'stock_id': 'Stock_id', 
@@ -147,18 +163,14 @@ def run_event_study(price_df, disposal_info, offset_days=3):
             '處置條件': 'condition'
         })
         
-        # [Modified] Simplify condition text
         if 'condition' in events.columns:
             events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
             
-        # 處置開始時間可能是 start date, 不需再運算
         start_events = events.copy()
         start_events['event_date'] = pd.to_datetime(start_events['event_date'])
-        # 去除重複
         start_events = start_events.drop_duplicates(subset=['Stock_id', 'event_date'])
         
     else:
-        print("Using legacy logic (calculating start date from continuous periods).")
         events = disposal_info[['stock_id', 'date']].sort_values(['stock_id', 'date'])
         events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_date'})
         events['event_date'] = pd.to_datetime(events['event_date'])
@@ -168,8 +180,6 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         events['days_diff'] = (events['event_date'] - events['prev_date']).dt.days
         is_start = events['days_diff'].isna() | (events['days_diff'] > 1)
         start_events = events[is_start][['Stock_id', 'event_date']].copy()
-    
-    print(f"Consolidated Start Events: {len(start_events)}")
     
     # 3. 找出事件日對應的交易日索引
     event_indices = pd.merge(
