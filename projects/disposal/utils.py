@@ -165,9 +165,25 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     else:
         # Fallback
         events = disposal_info[['stock_id', 'date']].rename(columns={'stock_id': 'Stock_id', 'date': 'event_start_date'})
-        events['event_end_date'] = events['event_start_date'] # Assume 1 day if unknown
         events['event_start_date'] = pd.to_datetime(events['event_start_date'])
         events['event_end_date'] = pd.to_datetime(events['event_end_date'])
+        
+    # [Added] Continuity Classification Logic
+    # Sort by Stock and Start Date to determine if it's a "continuation" (Second) or "new" (First)
+    events = events.sort_values(['Stock_id', 'event_start_date'])
+    
+    # Calculate gap from previous end date of the SAME stock
+    events['prev_end_date'] = events.groupby('Stock_id')['event_end_date'].shift(1)
+    events['gap_to_prev'] = (events['event_start_date'] - events['prev_end_date']).dt.days
+    
+    # Define Logic:
+    # Gap <= 3.5 days (handling weekend/overlaps) => Continuation => Second Disposal
+    # Gap > 3.5 or NaN (First event) => New => First Disposal
+    events['is_second_disposal'] = events['gap_to_prev'].fillna(9999) <= 3.5
+    events['is_first_disposal'] = ~events['is_second_disposal']
+    
+    # Clean up temporary columns
+    events = events.drop(columns=['prev_end_date', 'gap_to_prev'])
     
     # 3. 合併 (Cross Join logic but filtered)
     # 由於一個股票可能有多個處置區間，且區間可能重疊，最好的方式是 merge 後過濾
@@ -229,15 +245,11 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     event_study_df = event_study_df.dropna(subset=['relative_day'])
     event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
 
-    # [Moved] Create Classification Columns FIRST
-    if 'interval' in event_study_df.columns:
-        # First Disposal: Interval < 10 mins (usually 5)
-        event_study_df['is_first_disposal'] = event_study_df['interval'].fillna(0) < 10
-        # Second Disposal: Interval >= 10 mins (usually 20+)
-        event_study_df['is_second_disposal'] = event_study_df['interval'].fillna(0) >= 10
-    else:
-        event_study_df['is_first_disposal'] = False
-        event_study_df['is_second_disposal'] = False
+    event_study_df = event_study_df.dropna(subset=['relative_day'])
+    event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
+
+    # [Removed] Old Interval-based Classification Logic 
+    # (Classification is now done in Step 2 based on continuity)
 
     # 6. 產生 t_label
     def format_t(x):
