@@ -6,43 +6,42 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
 
-def fetch_and_filter_price(client, stock_id, event_dates, offset_days=3):
+def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offset_days=3):
     """
-    針對單檔股票，抓取處置日前後指定天數的股價資料。
+    針對單檔股票，抓取並篩選出落在 [Start-Offset, End+Offset] 區間內的股價。
+    支援多個處置區間（取聯集）。
     """
-    if event_dates.empty:
+    if start_dates.empty or end_dates.empty:
         return None
 
-    # 決定抓取的時間範圍 (min - offset ~ max + offset)
-    min_date = event_dates.min() - timedelta(days=offset_days)
-    max_date = event_dates.max() + timedelta(days=offset_days)
+    # 1. 決定抓取的最大範圍 (全域 Min ~ 全域 Max)
+    # 這能減少對 API 的請求次數 (一次抓一大段)
+    global_min = start_dates.min() - timedelta(days=offset_days)
+    global_max = end_dates.max() + timedelta(days=offset_days)
     
-    start_str = min_date.strftime('%Y-%m-%d')
-    end_str = max_date.strftime('%Y-%m-%d')
+    start_str = global_min.strftime('%Y-%m-%d')
+    end_str = global_max.strftime('%Y-%m-%d')
     
     try:
         # 初始化並抓取資料
-        # 注意：假設 client 有 initialize_frame 和 get_stock_price 方法
         client.initialize_frame(stock_id=stock_id, start_time=start_str, end_time=end_str)
         price_df = client.get_stock_price()
         
         if price_df.empty:
             return None
             
-        price_df = price_df.reset_index()
+        price_df = price_df.reset_index() # Ensure Date is a column
+        price_df['Date'] = pd.to_datetime(price_df['Date'])
         
-        # 建立篩選遮罩 (Mask)
-        # 只要日期落在任一處置事件的前後範圍內，即保留
+        # 2. 建立精確篩選遮罩 (Mask)
         mask = pd.Series(False, index=price_df.index)
         
-        # 優化：向量化處理日期篩選可能比較困難，因為區間多且不連續
-        # 但我們可以先轉換為 datetime 以加速比較
-        price_dates = pd.to_datetime(price_df['Date'])
-        
-        for event_date in event_dates:
-            d_start = event_date - timedelta(days=offset_days)
-            d_end = event_date + timedelta(days=offset_days)
-            mask |= (price_dates >= d_start) & (price_dates <= d_end)
+        # 針對每一筆處置事件，把該區間 [Start-3, End+3] 的日期都標記為 True
+        # 使用 zip 同時遍歷開始與結束時間
+        for s_date, e_date in zip(start_dates, end_dates):
+            d_start = s_date - timedelta(days=offset_days)
+            d_end = e_date + timedelta(days=offset_days)
+            mask |= (price_df['Date'] >= d_start) & (price_df['Date'] <= d_end)
             
         filtered_df = price_df[mask].copy()
         if filtered_df.empty:
@@ -54,62 +53,52 @@ def fetch_and_filter_price(client, stock_id, event_dates, offset_days=3):
         print(f"Error fetching {stock_id}: {e}")
         return None
 
-# Add explicit import inside function or global import if possible
-# But to avoid circular imports if this module is imported by others, better to import inside.
-# However, standard practice is top-level. Let's add top-level import for FinMindClient via string or pass the class?
-# Easier: Just import it inside the function or assume access.
-# Let's add the import at the top of the file first in another step? 
-# OR: We can use the existing client to get the token, and make new clients.
-
-def _fetch_worker(stock_id, dates, offset_days, token=None):
+def _fetch_worker_range(stock_id, start_dates, end_dates, offset_days, token=None):
     from module.get_info_FinMind import FinMindClient
     # Create a new local client for thread safety
     local_client = FinMindClient()
     if token:
         local_client.login_by_token(token)
-    return fetch_and_filter_price(local_client, stock_id, dates, offset_days)
+    return fetch_and_filter_price_range(local_client, stock_id, start_dates, end_dates, offset_days)
 
 def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     """
     使用多執行緒平行抓取所有股票的價格資料。
-    支援 Finlab 資料格式 (自動偵測 '處置開始時間' 欄位)。
-    [Safety Fix] Create independent clients for each thread to avoid race conditions.
+    支援 Finlab 資料格式 (自動偵測 '處置開始時間' 與 '處置結束時間')。
     """
     disposal_events = disposal_info.copy()
-    
-    # Extract token from the passed client to reuse
     token = client.config.api_token if hasattr(client, 'config') else None
 
-    # 偵測是否為 Finlab 資料格式
-    is_finlab = '處置開始時間' in disposal_events.columns
-    
-    if is_finlab:
-        # 使用 'stock_id' 和 '處置開始時間'
+    # 欄位偵測
+    if '處置開始時間' in disposal_events.columns and '處置結束時間' in disposal_events.columns:
         unique_stocks = disposal_events['stock_id'].unique()
-        date_col = '處置開始時間'
+        col_start = '處置開始時間'
+        col_end = '處置結束時間'
+        print(f"Detected Finlab format. Using '{col_start}' and '{col_end}' for range filtering.")
+    elif 'date' in disposal_events.columns:
+        # Fallback for old format (assume single day event, start=end)
+        unique_stocks = disposal_events['stock_id'].unique()
+        col_start = 'date'
+        col_end = 'date'
+        print(f"Using single date column '{col_start}' (Start=End).")
     else:
-        # 舊有邏輯
-        unique_stocks = disposal_events['stock_id'].unique()
-        date_col = 'date'
+        print("Error: Required date columns not found.")
+        return pd.DataFrame()
     
     print(f"Starting batch fetch for {len(unique_stocks)} stocks with {max_workers} workers...")
-    print(f"Using date column: {date_col}")
     
     all_prices = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交任務
         future_to_stock = {}
         for stock_id in unique_stocks:
-            stock_dates = disposal_events[disposal_events['stock_id'] == stock_id][date_col]
-            # 確保日期格式正確
-            stock_dates = pd.to_datetime(stock_dates)
+            subset = disposal_events[disposal_events['stock_id'] == stock_id]
+            starts = pd.to_datetime(subset[col_start])
+            ends = pd.to_datetime(subset[col_end])
             
-            # [Fix] Use _fetch_worker to instantiate new client per thread
-            future = executor.submit(_fetch_worker, stock_id, stock_dates, offset_days, token)
+            future = executor.submit(_fetch_worker_range, stock_id, starts, ends, offset_days, token)
             future_to_stock[future] = stock_id
             
-        # 處理結果 (顯示進度條)
         for future in tqdm(as_completed(future_to_stock), total=len(unique_stocks), desc="Fetching Prices"):
             stock_id = future_to_stock[future]
             try:
@@ -119,7 +108,6 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
             except Exception as exc:
                 print(f"{stock_id} generated an exception: {exc}")
     
-    # 合併與整理
     if all_prices:
         final_df = pd.concat(all_prices).drop_duplicates()
         print(f"Fetched total {len(final_df)} rows.")
@@ -131,10 +119,9 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
 def run_event_study(price_df, disposal_info, offset_days=3):
     """
     執行事件研究分析：
-    1. 判定處置起始日 (Event Definition) - 支援 Finlab 直接指定
-    2. 計算交易日索引 (Trading Index)
-    3. 計算假日間隔 (Gap Days)
-    4. 計算相對天數 (Relative Days)
+    1. 判定處置區間 (Start to End)
+    2. 合併並標記相對天數 (t-label)
+    3. 保留 [Start-Offset, End+Offset] 的所有資料
     """
     if price_df.empty:
         print("Price DataFrame is empty.")
@@ -142,23 +129,27 @@ def run_event_study(price_df, disposal_info, offset_days=3):
             
     # 1. 準備股價表
     prices = price_df.sort_values(['Stock_id', 'Date']).copy()
+    
+    # [Added] Filter invalid prices (Open > 0) to avoid infinite returns
+    prices = prices[prices['Open'] > 0].copy()
+    
     prices['Date'] = pd.to_datetime(prices['Date'])
     
-    # 建立交易日索引 (0, 1, 2...)
+    # 建立交易日索引
     prices['trading_idx'] = prices.groupby('Stock_id').cumcount()
     
-    # 計算 Gap Days (前移至合併前計算)
+    # 計算 Gap Days
     prices['prev_trade_date'] = prices.groupby('Stock_id')['Date'].shift(1)
     prices['trade_date_diff'] = (prices['Date'] - prices['prev_trade_date']).dt.days
     prices['gap_days'] = prices['trade_date_diff'].fillna(1) - 1
     
-    # 2. 準備事件表 (Start Date Detection)
-    # 判斷是否為 Finlab 資料
+    # 2. 準備事件表 (Start & End)
     if '處置開始時間' in disposal_info.columns:
-        events = disposal_info[['stock_id', '處置開始時間', '分時交易', '處置條件']].copy()
+        events = disposal_info[['stock_id', '處置開始時間', '處置結束時間', '分時交易', '處置條件']].copy()
         events = events.rename(columns={
             'stock_id': 'Stock_id', 
-            '處置開始時間': 'event_date',
+            '處置開始時間': 'event_start_date',
+            '處置結束時間': 'event_end_date',
             '分時交易': 'interval',
             '處置條件': 'condition'
         })
@@ -166,76 +157,151 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         if 'condition' in events.columns:
             events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
             
-        start_events = events.copy()
-        start_events['event_date'] = pd.to_datetime(start_events['event_date'])
-        start_events = start_events.drop_duplicates(subset=['Stock_id', 'event_date'])
+        # 移除重複的事件 (同樣的股票、同樣的區間)
+        events['event_start_date'] = pd.to_datetime(events['event_start_date'])
+        events['event_end_date'] = pd.to_datetime(events['event_end_date'])
+        events = events.drop_duplicates(subset=['Stock_id', 'event_start_date', 'event_end_date'])
         
     else:
-        events = disposal_info[['stock_id', 'date']].sort_values(['stock_id', 'date'])
-        events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_date'})
-        events['event_date'] = pd.to_datetime(events['event_date'])
-        
-        # 找出連續期間的起始日
-        events['prev_date'] = events.groupby('Stock_id')['event_date'].shift(1)
-        events['days_diff'] = (events['event_date'] - events['prev_date']).dt.days
-        is_start = events['days_diff'].isna() | (events['days_diff'] > 1)
-        start_events = events[is_start][['Stock_id', 'event_date']].copy()
+        # Fallback
+        events = disposal_info[['stock_id', 'date']].rename(columns={'stock_id': 'Stock_id', 'date': 'event_start_date'})
+        events['event_end_date'] = events['event_start_date'] # Assume 1 day if unknown
+        events['event_start_date'] = pd.to_datetime(events['event_start_date'])
+        events['event_end_date'] = pd.to_datetime(events['event_end_date'])
     
-    # 3. 找出事件日對應的交易日索引
-    event_indices = pd.merge(
-        start_events, 
-        prices[['Stock_id', 'Date', 'trading_idx']], 
-        left_on=['Stock_id', 'event_date'], 
-        right_on=['Stock_id', 'Date'], 
-        how='inner'
-    )
+    # 3. 合併 (Cross Join logic but filtered)
+    # 由於一個股票可能有多個處置區間，且區間可能重疊，最好的方式是 merge 後過濾
+    # 先只 merge Stock_id
+    merged = pd.merge(prices, events, on='Stock_id', how='inner')
     
-    # [Modified] Dynamic column selection for retention
-    cols_to_keep = ['Stock_id', 'event_date', 'trading_idx']
-    if 'condition' in start_events.columns:
-        cols_to_keep.append('condition')
-    if 'interval' in start_events.columns:
-        cols_to_keep.append('interval')
-        
-    event_indices = event_indices[cols_to_keep].rename(columns={'trading_idx': 'event_idx'})
+    # 4. 過濾有效資料：保留在 [Start - offset, End + offset] 範圍內的列
+    # 注意：這裡 offset_days 必須與 fetch 時一致或更小
+    mask = (merged['Date'] >= merged['event_start_date'] - timedelta(days=offset_days)) & \
+           (merged['Date'] <= merged['event_end_date'] + timedelta(days=offset_days))
     
-    # 4. 合併股價與事件索引
-    merged = pd.merge(prices, event_indices, on='Stock_id', how='inner')
-    
-    # 5. 計算相對天數 (Relative Trading Days)
-    merged['relative_day'] = merged['trading_idx'] - merged['event_idx']
-    
-    # 6. 計算自然日相對天數
-    merged['calendar_relative_day'] = (merged['Date'] - merged['event_date']).dt.days
-    
-    # 7. 篩選範圍
-    mask = (merged['relative_day'] >= -offset_days) & (merged['relative_day'] <= offset_days)
     event_study_df = merged[mask].copy()
     
-    # 8. 產生 t_label
+    # 5. 計算相對天數
+    # 這裡我們需要找到 event_start_date 對應的 trading_idx，才能算出 t+N
+    # 為了效能，我們建立一個 lookup table
+    # 找出每個 (Stock_id, Date) 的 trading_idx
+    trade_idx_map = prices.set_index(['Stock_id', 'Date'])['trading_idx']
+    
+    # 為每筆事件找出 Start Date 的 Trading Index
+    # 注意：Start Date 可能不是交易日，需用 searchsorted 或類似邏輯去找 "最近的交易日"
+    # 簡單做法：將 Event Start Date 對應到 Price Table (Merge left on Stock, Start Date)
+    # 但如果 Start Date 是假日，會對不起來。
+    # 改進：使用 merge_asof if sorted? 
+    # 或是由 event_study_df 中，針對每個 event_grp，找出 Date >= Start 的第一筆，設為 t=0
+    
+    # 讓我們用更簡單的邏輯：
+    # 已經有 trading_idx。對於每一行，我們知道它的 Date 和 event_start_date。
+    # 我們需要知道 event_start_date 當天的 trading_idx。
+    # 如果 event_start_date 是假日，通常處置開始日會是交易日。如果不幸是假日，取之後的第一個交易日。
+    
+    # 方法：
+    # 計算 `Date - StartDate` 的天數 (Calendar Days)
+    event_study_df['calendar_relative_day'] = (event_study_df['Date'] - event_study_df['event_start_date']).dt.days
+    
+    # 計算 Relative Trading Days
+    # 先找出每個 (Stock, EventStart) 的基準 Trading Index
+    # Step A: 找出所有 Event Start Date 在該股票 trading_idx 的位置
+    # 利用 prices 表
+    start_indices = prices.reset_index().merge(
+        events[['Stock_id', 'event_start_date']], 
+        left_on=['Stock_id', 'Date'], 
+        right_on=['Stock_id', 'event_start_date'],
+        how='right' # Keep all events
+    )
+    # 如果 StartDate 沒對到 (假日)，trading_idx 會是 NaN。需 Backfill。
+    # 但這裡我們只要有對到的就好，大部分處置起始日都是交易日。
+    # 為了嚴謹，若 Start Date 沒對到，我們似乎無法定義 t=0。
+    # 假設 Finlab 資料的處置起始日都是交易日。
+    start_idx_map = start_indices.dropna(subset=['trading_idx']).set_index(['Stock_id', 'event_start_date'])['trading_idx']
+    
+    # Map back to main df
+    event_study_df = event_study_df.join(start_idx_map, on=['Stock_id', 'event_start_date'], rsuffix='_start')
+    
+    # 計算 relative day
+    event_study_df['relative_day'] = event_study_df['trading_idx'] - event_study_df['trading_idx_start']
+    
+    # 若有 NaN (表示起始日非交易日)，則無法計算精確 t，暫時填入 NaN 或移除
+    event_study_df = event_study_df.dropna(subset=['relative_day'])
+    event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
+
+    # [Moved] Create Classification Columns FIRST
+    if 'interval' in event_study_df.columns:
+        # First Disposal: Interval < 10 mins (usually 5)
+        event_study_df['is_first_disposal'] = event_study_df['interval'].fillna(0) < 10
+        # Second Disposal: Interval >= 10 mins (usually 20+)
+        event_study_df['is_second_disposal'] = event_study_df['interval'].fillna(0) >= 10
+    else:
+        event_study_df['is_first_disposal'] = False
+        event_study_df['is_second_disposal'] = False
+
+    # 6. 產生 t_label
     def format_t(x):
         if x > 0: return f't+{x}'
         elif x < 0: return f't{x}'
         else: return 't+0'
-    event_study_df['t_label'] = event_study_df['relative_day'].apply(format_t)
+    # Temporary generic label
+    t_label_series = event_study_df['relative_day'].apply(format_t)
     
-    # 9. 正規化 (Normalization) - 已移除
-    pass
+    # Split into two columns (Now safe to use is_first_disposal)
+    event_study_df['t_label_first'] = event_study_df.apply(
+        lambda row: t_label_series[row.name] if row['is_first_disposal'] else None, axis=1
+    )
+    event_study_df['t_label_second'] = event_study_df.apply(
+        lambda row: t_label_series[row.name] if row['is_second_disposal'] else None, axis=1
+    )
     
-    # 10. 整理欄位
-    base_cols = ['Date', 'Stock_id', 't_label', 'relative_day', 'gap_days', 'calendar_relative_day']
+    # 7. 轉置為寬表格 (Wide Format) 以消除重複日期
+    print("Converting to Wide Format...")
+    
+    # A. 準備基礎價格表 (Base Price Data) - 確保唯一性
     price_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    base_cols = ['Date', 'Stock_id'] + price_cols
+    df_base = event_study_df[base_cols].drop_duplicates(subset=['Date', 'Stock_id'])
     
-    cols = list(base_cols)
-    # Add condition and interval before price columns
-    if 'condition' in event_study_df.columns:
-        cols.append('condition')
-    if 'interval' in event_study_df.columns:
-        cols.append('interval')
+    # B. 準備事件屬性欄位
+    # 這些欄位需要分流 (Split)
+    event_attrs = ['condition', 'interval', 'event_start_date', 'event_end_date', 
+                   'relative_day', 'gap_days', 'calendar_relative_day']
+    # 僅保留實際存在的欄位
+    existing_attrs = [col for col in event_attrs if col in event_study_df.columns]
+    
+    # C. 處理第一次處置 (First Disposal)
+    df_first = event_study_df[event_study_df['is_first_disposal']].copy()
+    if not df_first.empty:
+        # 如果同一天有多個第一次處置，保留 Event Start Date 最近的 (較新的事件)
+        df_first = df_first.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
         
-    cols.extend(price_cols)
+        # 欄位更名 (_first)
+        rename_dict = {col: f"{col}_first" for col in existing_attrs}
+        # t_label 已經是 _first 了，不需要改
+        cols_to_keep = ['Date', 'Stock_id', 't_label_first'] + existing_attrs
+        df_first = df_first[cols_to_keep].rename(columns=rename_dict)
     
-    final_df = event_study_df[cols].sort_values(['Stock_id', 'Date'])
+    # D. 處理第二次處置 (Second Disposal)
+    df_second = event_study_df[event_study_df['is_second_disposal']].copy()
+    if not df_second.empty:
+        df_second = df_second.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
+        
+        rename_dict = {col: f"{col}_second" for col in existing_attrs}
+        cols_to_keep = ['Date', 'Stock_id', 't_label_second'] + existing_attrs
+        df_second = df_second[cols_to_keep].rename(columns=rename_dict)
+        
+    # E. 合併 (Merge)
+    final_df = df_base
+    
+    if not df_first.empty:
+        final_df = final_df.merge(df_first, on=['Date', 'Stock_id'], how='left')
+        
+    if not df_second.empty:
+        final_df = final_df.merge(df_second, on=['Date', 'Stock_id'], how='left')
+        
+    # F. 最終整理
+    final_df = final_df.sort_values(['Stock_id', 'Date'])
     final_df['daily_ret'] = (final_df['Close']/final_df['Open']) - 1
     
     print(f"Analysis completed. Result shape: {final_df.shape}")
