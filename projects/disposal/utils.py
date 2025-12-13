@@ -332,6 +332,10 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # Remove duplicates
     events = events.drop_duplicates(subset=['Stock_id', 'event_start_date', 'event_end_date'])
     
+    # Ensure dates are datetime objects (critical for timedelta operations)
+    events['event_start_date'] = pd.to_datetime(events['event_start_date'])
+    events['event_end_date'] = pd.to_datetime(events['event_end_date'])
+    
     # Ensure disposal_level exists (for fallback cases)
     if 'disposal_level' not in events.columns:
         # Fallback: simple mapping from boolean if available, else all 1
