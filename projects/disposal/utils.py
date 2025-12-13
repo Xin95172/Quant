@@ -12,20 +12,30 @@ def process_disposal_events(disposal_info):
     2. 排序並計算 Gap
     3. 標記 First/Second Disposal
     """
-    events = disposal_info.copy()
+    import pandas as pd
+    # 強制轉為 Pandas DataFrame
+    events = pd.DataFrame(disposal_info).copy()
     
+    # 檢查是否需要 Reset Index (因應 Finlab 可能將 stock_id 設為 Index)
+    if 'stock_id' not in events.columns and 'Stock_id' not in events.columns:
+        events = events.reset_index()
+
     # 1. 欄位映射與標準化
+    # 統一將 stock_id 轉為 Stock_id
+    if 'stock_id' in events.columns:
+        events = events.rename(columns={'stock_id': 'Stock_id'})
+        
     if '處置開始時間' in events.columns:
         events = events.rename(columns={
-            'stock_id': 'Stock_id', 
             '處置開始時間': 'event_start_date',
             '處置結束時間': 'event_end_date',
             '分時交易': 'interval',
             '處置條件': 'condition'
         })
     elif 'date' in events.columns:
-         events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_start_date'})
+         events = events.rename(columns={'date': 'event_start_date'})
          events['event_end_date'] = events['event_start_date']
+         
 
     # 確保日期格式
     events['event_start_date'] = pd.to_datetime(events['event_start_date'])
@@ -34,7 +44,26 @@ def process_disposal_events(disposal_info):
     if 'condition' in events.columns:
         events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
 
+    # Debug info
+    print(f"Columns before processing: {events.columns.tolist()}")
+
     # 2. 排序
+    # Ensure Stock_id exists
+    if 'Stock_id' not in events.columns:
+        # Try finding case-insensitive match
+        for col in events.columns:
+            if col.lower() == 'stock_id':
+                events = events.rename(columns={col: 'Stock_id'})
+                break
+    
+    if 'Stock_id' not in events.columns:
+         # Last resort: use index name if matches
+         if events.index.name and events.index.name.lower() == 'stock_id':
+             events = events.reset_index()
+             events = events.rename(columns={events.columns[0]: 'Stock_id'}) # Assuming reset puts it at 0, or use name
+         else:
+             raise KeyError(f"Column 'Stock_id' not found. Available columns: {events.columns.tolist()}")
+
     events = events.sort_values(['Stock_id', 'event_start_date'])
     
     # 3. 動態層級判斷 (Dynamic Level Classification)
@@ -158,7 +187,19 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     使用多執行緒平行抓取所有股票的價格資料。
     支援 Finlab 資料格式 (自動偵測 '處置開始時間' 與 '處置結束時間')。
     """
-    disposal_events = disposal_info.copy()
+    import pandas as pd
+    # Ensure it's a standard pandas DataFrame (dissociate from Finlab objects)
+    disposal_events = pd.DataFrame(disposal_info).copy()
+    
+    # Normalize stock_id column name
+    if 'stock_id' in disposal_events.columns and 'Stock_id' not in disposal_events.columns:
+        disposal_events = disposal_events.rename(columns={'stock_id': 'Stock_id'})
+    # Handle case where stock_id might be in index
+    if 'Stock_id' not in disposal_events.columns and 'stock_id' not in disposal_events.columns:
+        disposal_events = disposal_events.reset_index()
+        if 'stock_id' in disposal_events.columns:
+             disposal_events = disposal_events.rename(columns={'stock_id': 'Stock_id'})
+             
     token = client.config.api_token if hasattr(client, 'config') else None
 
     # 欄位偵測
@@ -169,13 +210,14 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
         col_end = 'event_end_date'
         print(f"Using pre-processed columns '{col_start}' and '{col_end}'.")
     elif '處置開始時間' in disposal_events.columns and '處置結束時間' in disposal_events.columns:
-        unique_stocks = disposal_events['stock_id'].unique()
+        unique_stocks = disposal_events['Stock_id'].unique()
         col_start = '處置開始時間'
         col_end = '處置結束時間'
         print(f"Detected Finlab format. Using '{col_start}' and '{col_end}' for range filtering.")
     elif 'date' in disposal_events.columns:
         # Fallback for old format (assume single day event, start=end)
-        unique_stocks = disposal_events['stock_id'].unique()
+        unique_stocks = disposal_events['Stock_id'].unique()
+
         col_start = 'date'
         col_end = 'date'
         print(f"Using single date column '{col_start}' (Start=End).")
@@ -190,7 +232,7 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_stock = {}
         for stock_id in unique_stocks:
-            subset = disposal_events[disposal_events['stock_id'] == stock_id]
+            subset = disposal_events[disposal_events['Stock_id'] == stock_id]
             starts = pd.to_datetime(subset[col_start])
             ends = pd.to_datetime(subset[col_end])
             
