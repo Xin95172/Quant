@@ -390,29 +390,59 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # 假設 Finlab 資料的處置起始日都是交易日。
     start_idx_map = start_indices.dropna(subset=['trading_idx']).set_index(['Stock_id', 'event_start_date'])['trading_idx']
     
+    # Also find End Date Trading Index for "e+N" labeling
+    end_indices = prices.reset_index().merge(
+        events[['Stock_id', 'event_end_date']],
+        left_on=['Stock_id', 'Date'],
+        right_on=['Stock_id', 'event_end_date'],
+        how='right'
+    )
+    end_idx_map = end_indices.dropna(subset=['trading_idx']).set_index(['Stock_id', 'event_end_date'])['trading_idx']
+
     # Map back to main df
     event_study_df = event_study_df.join(start_idx_map, on=['Stock_id', 'event_start_date'], rsuffix='_start')
+    event_study_df = event_study_df.join(end_idx_map, on=['Stock_id', 'event_end_date'], rsuffix='_end')
     
-    # 計算 relative day
+    # 計算 relative day (start based)
     event_study_df['relative_day'] = event_study_df['trading_idx'] - event_study_df['trading_idx_start']
+    # relative day (end based)
+    event_study_df['relative_day_end'] = event_study_df['trading_idx'] - event_study_df['trading_idx_end']
     
     # 若有 NaN (表示起始日非交易日)，則無法計算精確 t，暫時填入 NaN 或移除
     event_study_df = event_study_df.dropna(subset=['relative_day'])
     event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
+    # Note: relative_day_end might be NaN if end date is not trading day, but it's only critical for e+N labels which happen AFTER end date (should be valid trading days)
 
-    event_study_df = event_study_df.dropna(subset=['relative_day'])
-    event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
 
     # [Removed] Old Interval-based Classification Logic 
     # (Classification is now done in Step 2 based on continuity)
 
-    # 6. 產生 t_label
-    def format_t(x):
-        if x > 0: return f't+{x}'
-        elif x < 0: return f't{x}'
-        else: return 't+0'
-    # Temporary generic label
-    t_label_series = event_study_df['relative_day'].apply(format_t)
+    # 6. 產生 t_label (s+N / e+N format)
+    def generate_label(row):
+        # Check if Date is >= event_end_date (User request: End Date should be e+0)
+        # Logic: If current date is at or AFTER end date, use e+N
+        
+        # We can use trading_idx diff check or actual date check
+        # Date check is safer against index mapping issues
+        if row['Date'] >= row['event_end_date']:
+            # e+N
+            # If relative_day_end is NaN (end date was holiday), we approximate:
+            # But usually we want clean trading days.
+            if pd.notna(row.get('relative_day_end')):
+                val = int(row['relative_day_end'])
+                # val should be >= 0 since Date >= EndDate
+                return f'e+{val}'
+            
+            # If logic fails or special case, fall through to s+
+            
+        # Default: s+N / s-N
+        val_s = int(row['relative_day'])
+        if val_s >= 0:
+            return f's+{val_s}'
+        else:
+            return f's{val_s}' # s-3
+
+    t_label_series = event_study_df.apply(generate_label, axis=1)
     
     # Split into two columns (Now safe to use is_first_disposal)
     # Split into columns dynamically based on level
@@ -451,6 +481,9 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     
     
     # C. Dynamic Processing for each level
+    # Initialize final_df with base data
+    final_df = df_base.copy()
+    
     # 處理每一個 Level
     for lvl in unique_levels:
         suffix = level_map.get(lvl, f"level_{lvl}")
@@ -476,8 +509,15 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         
     # F. 最終整理
     final_df = final_df.sort_values(['Stock_id', 'Date'])
-    final_df['daily_ret'] = (final_df['Close']/final_df['Open']) - 1
-    long_df['daily_ret'] = (long_df['Close']/long_df['Open']) - 1 # Ensure return is calculated for long df too
+    
+    # Calculate returns for Long format (stats)
+    long_df['daily_ret'] = (long_df['Close']/long_df['Open']) - 1 
+    
+    # Wide format cleanup:
+    # User requested removing price data from wide format to keep it clean (signals only)
+    cols_to_drop = ['Open', 'High', 'Low', 'Close', 'Volume', 'daily_ret'] # daily_ret might not be in final_df yet
+    valid_drop_cols = [c for c in cols_to_drop if c in final_df.columns]
+    final_df = final_df.drop(columns=valid_drop_cols)
     
     print(f"Analysis completed. Wide shape: {final_df.shape}, Long shape: {long_df.shape}")
     return final_df, long_df
