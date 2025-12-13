@@ -1,10 +1,102 @@
-
 import pandas as pd
 from datetime import timedelta
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
+
+def process_disposal_events(disposal_info):
+    """
+    前處理 Finlab 處置資料：
+    1. 欄位標準化 (Stock_id, event_start_date, event_end_date)
+    2. 排序並計算 Gap
+    3. 標記 First/Second Disposal
+    """
+    events = disposal_info.copy()
+    
+    # 1. 欄位映射與標準化
+    if '處置開始時間' in events.columns:
+        events = events.rename(columns={
+            'stock_id': 'Stock_id', 
+            '處置開始時間': 'event_start_date',
+            '處置結束時間': 'event_end_date',
+            '分時交易': 'interval',
+            '處置條件': 'condition'
+        })
+    elif 'date' in events.columns:
+         events = events.rename(columns={'stock_id': 'Stock_id', 'date': 'event_start_date'})
+         events['event_end_date'] = events['event_start_date']
+
+    # 確保日期格式
+    events['event_start_date'] = pd.to_datetime(events['event_start_date'])
+    events['event_end_date'] = pd.to_datetime(events['event_end_date'])
+    
+    if 'condition' in events.columns:
+        events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
+
+    # 2. 排序
+    events = events.sort_values(['Stock_id', 'event_start_date'])
+    
+    # 3. 動態層級判斷 (Dynamic Level Classification)
+    # 定義: 若 Start <= Prev_End + 3.5 days，則屬於同一個 Chain
+    # 為了解決 "Start <= Max(Prev_End_in_Chain)" 的問題，我們需要迭代檢查
+    # 但為了向量化效能，我們可以先計算 gap，再用 cumsum 分組
+    
+    # 這裡稍微複雜，因為我們需要拿 "上一筆處置的結束日" 來比，
+    # 但如果是連續重疊 (Chain)，我們應該拿 "目前 Chain 的最大結束日" 來比。
+    # 由於 Pandas 向量化較難處理 "Chain Max End"，我們使用 python loop 確保邏輯正確 (資料量 3000 筆，Loop 很快)
+
+    events['disposal_level'] = 1
+    
+    # 為了方便 Iteration，先重設 index
+    events = events.reset_index(drop=True)
+    
+    current_stock = None
+    chain_end_date = None
+    current_level = 1
+    
+    levels = []
+    
+    for idx, row in events.iterrows():
+        stock = row['Stock_id']
+        start = row['event_start_date']
+        end = row['event_end_date']
+        
+        if stock != current_stock:
+            # New Stock -> Reset
+            current_stock = stock
+            chain_end_date = end
+            current_level = 1
+        else:
+            # Same Stock
+            # Check overlap/continuity
+            # User requested strict overlap: Start <= Chain End
+            limit_date = chain_end_date 
+            
+            if start <= limit_date:
+                # Continuous -> Increase Level
+                current_level += 1
+                # Extend chain end if this event ends later
+                if end > chain_end_date:
+                    chain_end_date = end
+            else:
+                # Broken Chain -> Reset Level
+                current_level = 1
+                chain_end_date = end
+        
+        levels.append(current_level)
+        
+    events['disposal_level'] = levels
+    
+    # Generate Boolean Flags for backward compatibility (optional but good for debugging)
+    events['is_first_disposal'] = events['disposal_level'] == 1
+    events['is_second_disposal'] = events['disposal_level'] == 2
+    
+    print(f"Processed {len(events)} events.")
+    print("Level Distribution:")
+    print(events['disposal_level'].value_counts().sort_index())
+          
+    return events
 
 def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offset_days=3):
     """
@@ -70,7 +162,13 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     token = client.config.api_token if hasattr(client, 'config') else None
 
     # 欄位偵測
-    if '處置開始時間' in disposal_events.columns and '處置結束時間' in disposal_events.columns:
+    # 欄位偵測 (優先使用標準化欄位)
+    if 'event_start_date' in disposal_events.columns and 'event_end_date' in disposal_events.columns:
+        unique_stocks = disposal_events['Stock_id'].unique()
+        col_start = 'event_start_date'
+        col_end = 'event_end_date'
+        print(f"Using pre-processed columns '{col_start}' and '{col_end}'.")
+    elif '處置開始時間' in disposal_events.columns and '處置結束時間' in disposal_events.columns:
         unique_stocks = disposal_events['stock_id'].unique()
         col_start = '處置開始時間'
         col_end = '處置結束時間'
@@ -144,7 +242,16 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     prices['gap_days'] = prices['trade_date_diff'].fillna(1) - 1
     
     # 2. 準備事件表 (Start & End)
-    if '處置開始時間' in disposal_info.columns:
+    # Check if pre-processed
+    if 'event_start_date' in disposal_info.columns and 'is_first_disposal' in disposal_info.columns:
+        events = disposal_info.copy()
+        # Keep necessary columns
+        keep_cols = ['Stock_id', 'event_start_date', 'event_end_date', '分時交易', 'interval', 
+                     '處置條件', 'condition', 'is_first_disposal', 'is_second_disposal', 'disposal_level']
+        events = events[[c for c in keep_cols if c in events.columns]].copy()
+             
+    elif '處置開始時間' in disposal_info.columns:
+        # Fallback to internal processing logic if raw data passed
         events = disposal_info[['stock_id', '處置開始時間', '處置結束時間', '分時交易', '處置條件']].copy()
         events = events.rename(columns={
             'stock_id': 'Stock_id', 
@@ -157,33 +264,39 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         if 'condition' in events.columns:
             events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
             
-        # 移除重複的事件 (同樣的股票、同樣的區間)
         events['event_start_date'] = pd.to_datetime(events['event_start_date'])
         events['event_end_date'] = pd.to_datetime(events['event_end_date'])
-        events = events.drop_duplicates(subset=['Stock_id', 'event_start_date', 'event_end_date'])
+        
+        # Continuity Classification Logic (Internal Fallback)
+        events = events.sort_values(['Stock_id', 'event_start_date'])
+        events['prev_end_date'] = events.groupby('Stock_id')['event_end_date'].shift(1)
+        events['gap_to_prev'] = (events['event_start_date'] - events['prev_end_date']).dt.days
+        events['is_second_disposal'] = events['gap_to_prev'].fillna(9999) <= 3.5
+        events['is_first_disposal'] = ~events['is_second_disposal']
+        events = events.drop(columns=['prev_end_date', 'gap_to_prev'])
         
     else:
-        # Fallback
+        # Fallback Date
         events = disposal_info[['stock_id', 'date']].rename(columns={'stock_id': 'Stock_id', 'date': 'event_start_date'})
+        events['event_end_date'] = events['event_start_date']
         events['event_start_date'] = pd.to_datetime(events['event_start_date'])
         events['event_end_date'] = pd.to_datetime(events['event_end_date'])
         
-    # [Added] Continuity Classification Logic
-    # Sort by Stock and Start Date to determine if it's a "continuation" (Second) or "new" (First)
-    events = events.sort_values(['Stock_id', 'event_start_date'])
+        # Simple default
+        events['is_first_disposal'] = True
+        events['is_second_disposal'] = False
+        
     
-    # Calculate gap from previous end date of the SAME stock
-    events['prev_end_date'] = events.groupby('Stock_id')['event_end_date'].shift(1)
-    events['gap_to_prev'] = (events['event_start_date'] - events['prev_end_date']).dt.days
+    # Remove duplicates
+    events = events.drop_duplicates(subset=['Stock_id', 'event_start_date', 'event_end_date'])
     
-    # Define Logic:
-    # Gap <= 3.5 days (handling weekend/overlaps) => Continuation => Second Disposal
-    # Gap > 3.5 or NaN (First event) => New => First Disposal
-    events['is_second_disposal'] = events['gap_to_prev'].fillna(9999) <= 3.5
-    events['is_first_disposal'] = ~events['is_second_disposal']
-    
-    # Clean up temporary columns
-    events = events.drop(columns=['prev_end_date', 'gap_to_prev'])
+    # Ensure disposal_level exists (for fallback cases)
+    if 'disposal_level' not in events.columns:
+        # Fallback: simple mapping from boolean if available, else all 1
+        if 'is_second_disposal' in events.columns:
+            events['disposal_level'] = events.apply(lambda r: 2 if r['is_second_disposal'] else 1, axis=1)
+        else:
+            events['disposal_level'] = 1
     
     # 3. 合併 (Cross Join logic but filtered)
     # 由於一個股票可能有多個處置區間，且區間可能重疊，最好的方式是 merge 後過濾
@@ -260,12 +373,19 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     t_label_series = event_study_df['relative_day'].apply(format_t)
     
     # Split into two columns (Now safe to use is_first_disposal)
-    event_study_df['t_label_first'] = event_study_df.apply(
-        lambda row: t_label_series[row.name] if row['is_first_disposal'] else None, axis=1
-    )
-    event_study_df['t_label_second'] = event_study_df.apply(
-        lambda row: t_label_series[row.name] if row['is_second_disposal'] else None, axis=1
-    )
+    # Split into columns dynamically based on level
+    # Map level number to suffix name
+    level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
+    
+    unique_levels = sorted(event_study_df['disposal_level'].unique())
+    print(f"Detected Disposal Levels: {unique_levels}")
+    
+    for lvl in unique_levels:
+        suffix = level_map.get(lvl, f"level_{lvl}") # Fallback to level_5, level_6...
+        col_name = f't_label_{suffix}'
+        event_study_df[col_name] = event_study_df.apply(
+            lambda row: t_label_series[row.name] if row['disposal_level'] == lvl else None, axis=1
+        )
     
     # 7. 轉置為寬表格 (Wide Format) 以消除重複日期
     print("Converting to Wide Format...")
@@ -282,35 +402,30 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # 僅保留實際存在的欄位
     existing_attrs = [col for col in event_attrs if col in event_study_df.columns]
     
-    # C. 處理第一次處置 (First Disposal)
-    df_first = event_study_df[event_study_df['is_first_disposal']].copy()
-    if not df_first.empty:
-        # 如果同一天有多個第一次處置，保留 Event Start Date 最近的 (較新的事件)
-        df_first = df_first.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
-        
-        # 欄位更名 (_first)
-        rename_dict = {col: f"{col}_first" for col in existing_attrs}
-        # t_label 已經是 _first 了，不需要改
-        cols_to_keep = ['Date', 'Stock_id', 't_label_first'] + existing_attrs
-        df_first = df_first[cols_to_keep].rename(columns=rename_dict)
     
-    # D. 處理第二次處置 (Second Disposal)
-    df_second = event_study_df[event_study_df['is_second_disposal']].copy()
-    if not df_second.empty:
-        df_second = df_second.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
+    # C. Dynamic Processing for each level
+    # 處理每一個 Level
+    for lvl in unique_levels:
+        suffix = level_map.get(lvl, f"level_{lvl}")
         
-        rename_dict = {col: f"{col}_second" for col in existing_attrs}
-        cols_to_keep = ['Date', 'Stock_id', 't_label_second'] + existing_attrs
-        df_second = df_second[cols_to_keep].rename(columns=rename_dict)
+        # Filter data for this level
+        df_lvl = event_study_df[event_study_df['disposal_level'] == lvl].copy()
         
-    # E. 合併 (Merge)
-    final_df = df_base
-    
-    if not df_first.empty:
-        final_df = final_df.merge(df_first, on=['Date', 'Stock_id'], how='left')
-        
-    if not df_second.empty:
-        final_df = final_df.merge(df_second, on=['Date', 'Stock_id'], how='left')
+        if not df_lvl.empty:
+            # Deduplicate: Keep latest event start date
+            df_lvl = df_lvl.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
+            
+            # Rename columns
+            rename_dict = {col: f"{col}_{suffix}" for col in existing_attrs}
+            
+            # Keep t_label column
+            t_label_col = f't_label_{suffix}'
+            
+            cols_to_keep = ['Date', 'Stock_id', t_label_col] + existing_attrs
+            df_lvl = df_lvl[cols_to_keep].rename(columns=rename_dict)
+            
+            # Merge to final
+            final_df = final_df.merge(df_lvl, on=['Date', 'Stock_id'], how='left')
         
     # F. 最終整理
     final_df = final_df.sort_values(['Stock_id', 'Date'])
