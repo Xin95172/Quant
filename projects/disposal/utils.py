@@ -387,6 +387,11 @@ def run_event_study(price_df, disposal_info, offset_days=3):
             lambda row: t_label_series[row.name] if row['disposal_level'] == lvl else None, axis=1
         )
     
+    
+    # [Added] Capture Long Format Dataframe before pivoting
+    # This preserves all overlapping event rows for statistical usage per t-label/level
+    long_df = event_study_df.copy()
+    
     # 7. 轉置為寬表格 (Wide Format) 以消除重複日期
     print("Converting to Wide Format...")
     
@@ -430,6 +435,7 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # F. 最終整理
     final_df = final_df.sort_values(['Stock_id', 'Date'])
     final_df['daily_ret'] = (final_df['Close']/final_df['Open']) - 1
+    long_df['daily_ret'] = (long_df['Close']/long_df['Open']) - 1 # Ensure return is calculated for long df too
     
-    print(f"Analysis completed. Result shape: {final_df.shape}")
-    return final_df
+    print(f"Analysis completed. Wide shape: {final_df.shape}, Long shape: {long_df.shape}")
+    return final_df, long_df
