@@ -137,8 +137,13 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
 
     # 1. 決定抓取的最大範圍 (全域 Min ~ 全域 Max)
     # 這能減少對 API 的請求次數 (一次抓一大段)
-    global_min = start_dates.min() - timedelta(days=offset_days)
-    global_max = end_dates.max() + timedelta(days=offset_days)
+    # [Fix] Expand Date Range: Convert "Trading Days expectation" to "Calendar Days buffer"
+    # User might set offset_days=5 expecting 5 trading days.
+    # To be safe against holidays/weekends, we multiply by 2 and add a buffer.
+    safe_buffer = offset_days * 2 + 15
+    
+    global_min = start_dates.min() - timedelta(days=safe_buffer)
+    global_max = end_dates.max() + timedelta(days=safe_buffer)
     
     start_str = global_min.strftime('%Y-%m-%d')
     end_str = global_max.strftime('%Y-%m-%d')
@@ -155,15 +160,45 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
         price_df['Date'] = pd.to_datetime(price_df['Date'])
         
         # 2. 建立精確篩選遮罩 (Mask)
+        # 用戶要求：確定抓到的是「實際交易日」 (offset_days 代表交易日數)
         mask = pd.Series(False, index=price_df.index)
         
-        # 針對每一筆處置事件，把該區間 [Start-3, End+3] 的日期都標記為 True
-        # 使用 zip 同時遍歷開始與結束時間
+        # 建立 Date -> Index 的查找表 (加速搜尋)
+        # price_df 已經按時間排序 (FinMind 預設回傳排序過的，但保險起見可重排)
+        price_df = price_df.sort_values('Date').reset_index(drop=True)
+        date_map = pd.Series(price_df.index.values, index=price_df['Date'])
+        
+        dates_in_df = price_df['Date'].values
+        
         for s_date, e_date in zip(start_dates, end_dates):
-            d_start = s_date - timedelta(days=offset_days)
-            d_end = e_date + timedelta(days=offset_days)
-            mask |= (price_df['Date'] >= d_start) & (price_df['Date'] <= d_end)
+            # 找到 s_date 在 price_df 中的位置 (或最近的下一天)
+            # 使用 searchsorted 尋找插入點
+            idx_start = dates_in_df.searchsorted(s_date, side='left')
             
+            # 安全檢查：若 idx_start 超出範圍，修正
+            if idx_start >= len(dates_in_df):
+                idx_start = len(dates_in_df) - 1
+                
+            # 找到 e_date 在 price_df 中的位置 (或最近的上一天 -> searchsorted 'right' - 1)
+            idx_end = dates_in_df.searchsorted(e_date, side='right') - 1
+            
+            # 安全檢查
+            if idx_end < 0:
+                idx_end = 0
+            
+            # 交易日位移
+            # Start 往前推 offset_days
+            target_idx_start = max(0, idx_start - offset_days)
+            
+            # End 往後推 offset_days
+            target_idx_end = min(len(price_df) - 1, idx_end + offset_days)
+            
+            # 只有當起始 <= 結束時才標記 (處理例外)
+            if target_idx_start <= target_idx_end:
+                # 這裡的 index 是整數索引 (0, 1, 2...)
+                # 我們把這個範圍的 boolean mask 設為 True
+                mask.iloc[target_idx_start : target_idx_end + 1] = True
+
         filtered_df = price_df[mask].copy()
         if filtered_df.empty:
             return None
