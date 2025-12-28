@@ -1,6 +1,7 @@
 import pandas as pd
 from module.plot_func import plot
 from typing import Optional, List
+from IPython.display import display
 
 class DisposalAnalyzer:
     """
@@ -40,6 +41,26 @@ class DisposalAnalyzer:
             bar_kwargs={'width': 0.8}
         )
 
+    def _display_dataframe(self, col: str, title: str):
+        """以 Pandas DataFrame 顯示分佈統計"""
+        if col not in self.df.columns:
+            return
+            
+        print(f"\n[{title}]")
+        counts = self.df[col].value_counts().reset_index()
+        counts.columns = [col, 'Count']
+        
+        # Add Percentage
+        total = len(self.df)
+        counts['Percentage'] = (counts['Count'] / total * 100).map('{:.2f}%'.format)
+        
+        # Sort if numerical (like disposal_level)
+        if pd.api.types.is_numeric_dtype(counts[col]):
+            counts = counts.sort_values(col)
+            
+        # Display standard dataframe
+        display(counts)
+
     def overall_analysis(self, min_samples: int = 50, prefix: str = 't_label_'):
         """
         [Method 1] 多層級處置分析
@@ -49,9 +70,25 @@ class DisposalAnalyzer:
             print("Dataframe is empty. Please check data source.")
             return
 
-        print("Condition Counts:")
-        print(self.df['condition'].value_counts())
-        print("-" * 30)
+        self._display_dataframe('condition', 'Disposal Condition Distribution')
+
+        if 'disposal_level' in self.df.columns:
+            self._display_dataframe('disposal_level', 'Disposal Level Distribution')
+
+            # Visualization for Disposal Level (Effect Analysis)
+            level_stats = self.df.groupby('disposal_level')['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
+            # Ensure sorting by level
+            level_stats = level_stats.sort_values('disposal_level')
+            
+            plot(
+                df=level_stats,
+                x='disposal_level',
+                ly='mean',       # Top: Mean Daily Return
+                bar_col='count', # Bottom: Sample Count
+                ly_type='bar',
+                note="Disposal Effect by Level (1=First, 2=Second...)",
+                bar_kwargs={'width': 0.8}
+            )
 
         t_cols = [c for c in self.df.columns if c.startswith(prefix)]
         print(f"Found {len(t_cols)} levels with prefix '{prefix}'")
@@ -67,6 +104,9 @@ class DisposalAnalyzer:
             
             # Plot
             self._plot_stats(stats, target_col, note=f"Disposal Effect: {target_col}")
+
+
+
 
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):

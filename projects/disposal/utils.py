@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from datetime import timedelta
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,7 +13,6 @@ def process_disposal_events(disposal_info):
     2. 排序並計算 Gap
     3. 標記 First/Second Disposal
     """
-    import pandas as pd
     # 強制轉為 Pandas DataFrame
     events = pd.DataFrame(disposal_info).copy()
     
@@ -35,15 +35,11 @@ def process_disposal_events(disposal_info):
     elif 'date' in events.columns:
          events = events.rename(columns={'date': 'event_start_date'})
          events['event_end_date'] = events['event_start_date']
-         
 
     # 確保日期格式
     events['event_start_date'] = pd.to_datetime(events['event_start_date'])
     events['event_end_date'] = pd.to_datetime(events['event_end_date'])
     
-    if 'condition' in events.columns:
-        events['condition'] = events['condition'].astype(str).str.replace('因連續3個營業日達本中心作業要點第四條第一項第一款', '連續三次', regex=False)
-
     # Debug info
     print(f"Columns before processing: {events.columns.tolist()}")
 
@@ -99,8 +95,9 @@ def process_disposal_events(disposal_info):
         else:
             # Same Stock
             # Check overlap/continuity
-            # User requested strict overlap: Start <= Chain End
-            limit_date = chain_end_date 
+            # User requested strict overlap or close continuity (Chain)
+            # Add small buffer (e.g. 3.5 days) to account for weekends/minor gaps
+            limit_date = chain_end_date + pd.Timedelta(days=3.5)
             
             if start <= limit_date:
                 # Continuous -> Increase Level
@@ -117,14 +114,6 @@ def process_disposal_events(disposal_info):
         
     events['disposal_level'] = levels
     
-    # Generate Boolean Flags for backward compatibility (optional but good for debugging)
-    events['is_first_disposal'] = events['disposal_level'] == 1
-    events['is_second_disposal'] = events['disposal_level'] == 2
-    
-    print(f"Processed {len(events)} events.")
-    print("Level Distribution:")
-    print(events['disposal_level'].value_counts().sort_index())
-          
     return events
 
 def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offset_days=3):
@@ -142,6 +131,21 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
     # To be safe against holidays/weekends, we multiply by 2 and add a buffer.
     safe_buffer = offset_days * 2 + 15
     
+    # [Fix] Enforce datetime conversion to avoid 'int' vs 'Timestamp' confusion
+    # Sometimes inputs might be mixed types if upstream processing wasn't strict
+    start_dates = pd.to_datetime(start_dates, errors='coerce')
+    end_dates = pd.to_datetime(end_dates, errors='coerce')
+    
+    # Drop invalid dates
+    # Check if empty after dropna
+    valid_mask = start_dates.notna() & end_dates.notna()
+    if not valid_mask.all():
+         start_dates = start_dates[valid_mask]
+         end_dates = end_dates[valid_mask]
+         
+    if start_dates.empty or end_dates.empty:
+        return None
+
     global_min = start_dates.min() - timedelta(days=safe_buffer)
     global_max = end_dates.max() + timedelta(days=safe_buffer)
     
@@ -149,64 +153,98 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
     end_str = global_max.strftime('%Y-%m-%d')
     
     try:
-        # 初始化並抓取資料
-        client.initialize_frame(stock_id=stock_id, start_time=start_str, end_time=end_str)
-        price_df = client.get_stock_price()
+        # Wrap API call to catch FinMind's KeyError: 'data'
+        try:
+            client.initialize_frame(stock_id=stock_id, start_time=start_str, end_time=end_str)
+            price_df = client.get_stock_price()
+        except KeyError:
+            # FinMind returns KeyError 'data' if no data found or API error (Token/Limit)
+            print(f"[Warning] FinMind API returned no data for {stock_id}. This usually indicates an INVALID TOKEN or RATE LIMIT reached.")
+            return None
+        except Exception:
+            # Other API errors
+            return None
+        
+        if price_df is None or price_df.empty:
+            return None
+            
+        if 'Date' not in price_df.columns:
+            price_df = price_df.reset_index() # Ensure Date is a column
+        
+        if 'Date' not in price_df.columns:
+            # Should not happen if API is correct, but safe guard
+            return None
+
+        # [Fix] Strict conversion to datetime64[ns] to avoid int vs Timestamp comparison
+        price_df['Date'] = pd.to_datetime(price_df['Date'], errors='coerce')
+        price_df = price_df.dropna(subset=['Date'])
+        
+        # [Fix] Sort by Date to ensure index reflects time order
+        price_df = price_df.sort_values('Date').reset_index(drop=True)
+        
+        # [Critical Fix] Assign trading_idx BEFORE filtering
+        # This ensures that even if we filter out rows later, the remaining rows 
+        # keep their original index relative to the continuous trading history.
+        # [Fix] Use existing trading_idx if available to preserve continuity from fetch
+        # Otherwise generate new one (backward compatibility)
+        if 'trading_idx' not in price_df.columns:
+            price_df['trading_idx'] = price_df.index
         
         if price_df.empty:
             return None
-            
-        price_df = price_df.reset_index() # Ensure Date is a column
-        price_df['Date'] = pd.to_datetime(price_df['Date'])
+
+        # [Fix] Ensure numpy array is strictly datetime64[ns]
+        dates_in_df = price_df['Date'].values.astype('datetime64[ns]')
+        trading_indices = price_df['trading_idx'].values
         
         # 2. 建立精確篩選遮罩 (Mask)
         # 用戶要求：確定抓到的是「實際交易日」 (offset_days 代表交易日數)
         mask = pd.Series(False, index=price_df.index)
         
-        # 建立 Date -> Index 的查找表 (加速搜尋)
-        # price_df 已經按時間排序 (FinMind 預設回傳排序過的，但保險起見可重排)
-        price_df = price_df.sort_values('Date').reset_index(drop=True)
-        date_map = pd.Series(price_df.index.values, index=price_df['Date'])
-        
-        dates_in_df = price_df['Date'].values
-        
+        # Ensure start/end are iterables
+        if not isinstance(start_dates, (list, pd.Series, np.ndarray)):
+            start_dates = [start_dates]
+        if not isinstance(end_dates, (list, pd.Series, np.ndarray)):
+            end_dates = [end_dates]
+
         for s_date, e_date in zip(start_dates, end_dates):
-            # 找到 s_date 在 price_df 中的位置 (或最近的下一天)
-            # 使用 searchsorted 尋找插入點
-            idx_start = dates_in_df.searchsorted(s_date, side='left')
-            
-            # 安全檢查：若 idx_start 超出範圍，修正
-            if idx_start >= len(dates_in_df):
-                idx_start = len(dates_in_df) - 1
+            # [Fix] Validate and convert s_date/e_date to Timestamp
+            if pd.isna(s_date) or pd.isna(e_date):
+                continue
                 
-            # 找到 e_date 在 price_df 中的位置 (或最近的上一天 -> searchsorted 'right' - 1)
-            idx_end = dates_in_df.searchsorted(e_date, side='right') - 1
+            try:
+                s_ts = pd.Timestamp(s_date)
+                e_ts = pd.Timestamp(e_date)
+                if pd.isna(s_ts) or pd.isna(e_ts):
+                    continue
+                # [Fix] Convert to numpy datetime64 to avoid TypeError: '<' not supported between instances of 'int' and 'Timestamp'
+                s_val = s_ts.to_datetime64()
+                e_val = e_ts.to_datetime64()
+            except:
+                continue
+
+            # searchsorted works correctly with datetime64[ns] array and scalar
+            idx_start = dates_in_df.searchsorted(s_val, side='left')
+            idx_end = dates_in_df.searchsorted(e_val, side='right') - 1
             
-            # 安全檢查
-            if idx_end < 0:
-                idx_end = 0
-            
-            # 交易日位移
-            # Start 往前推 offset_days
             target_idx_start = max(0, idx_start - offset_days)
-            
-            # End 往後推 offset_days
             target_idx_end = min(len(price_df) - 1, idx_end + offset_days)
             
-            # 只有當起始 <= 結束時才標記 (處理例外)
             if target_idx_start <= target_idx_end:
-                # 這裡的 index 是整數索引 (0, 1, 2...)
-                # 我們把這個範圍的 boolean mask 設為 True
                 mask.iloc[target_idx_start : target_idx_end + 1] = True
 
+        # [Fix] Restore this line which was accidentally deleted
         filtered_df = price_df[mask].copy()
+        
         if filtered_df.empty:
             return None
             
         return filtered_df
         
     except Exception as e:
+        import traceback
         print(f"Error fetching {stock_id}: {e}")
+        print(traceback.format_exc()) 
         return None
 
 def _fetch_worker_range(stock_id, start_dates, end_dates, offset_days, token=None):
@@ -222,7 +260,6 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     使用多執行緒平行抓取所有股票的價格資料。
     支援 Finlab 資料格式 (自動偵測 '處置開始時間' 與 '處置結束時間')。
     """
-    import pandas as pd
     # Ensure it's a standard pandas DataFrame (dissociate from Finlab objects)
     disposal_events = pd.DataFrame(disposal_info).copy()
     
@@ -296,11 +333,11 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     執行事件研究分析：
     1. 判定處置區間 (Start to End)
     2. 合併並標記相對天數 (t-label)
-    3. 保留 [Start-Offset, End+Offset] 的所有資料
+    3. 保留 [Start-Offset, End+Offset] 的所有資料 (Based on Trading Index)
     """
     if price_df.empty:
         print("Price DataFrame is empty.")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
             
     # 1. 準備股價表
     prices = price_df.sort_values(['Stock_id', 'Date']).copy()
@@ -311,16 +348,18 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     prices['Date'] = pd.to_datetime(prices['Date'])
     
     # 建立交易日索引
-    prices['trading_idx'] = prices.groupby('Stock_id').cumcount()
+    # [Fix] Use existing trading_idx if available to keep original continuity (with gaps)
+    if 'trading_idx' not in prices.columns:
+        prices['trading_idx'] = prices.groupby('Stock_id').cumcount()
     
     # 計算 Gap Days
     prices['prev_trade_date'] = prices.groupby('Stock_id')['Date'].shift(1)
     prices['trade_date_diff'] = (prices['Date'] - prices['prev_trade_date']).dt.days
     prices['gap_days'] = prices['trade_date_diff'].fillna(1) - 1
     
-    # 2. 準備事件表 (Start & End)
+    # 2. 準備事件表
     # Check if pre-processed
-    if 'event_start_date' in disposal_info.columns and 'is_first_disposal' in disposal_info.columns:
+    if 'event_start_date' in disposal_info.columns and 'disposal_level' in disposal_info.columns:
         events = disposal_info.copy()
         # Keep necessary columns
         keep_cols = ['Stock_id', 'event_start_date', 'event_end_date', '分時交易', 'interval', 
@@ -367,114 +406,144 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     # Remove duplicates
     events = events.drop_duplicates(subset=['Stock_id', 'event_start_date', 'event_end_date'])
     
-    # Ensure dates are datetime objects (critical for timedelta operations)
+    # Ensure dates are datetime objects
     events['event_start_date'] = pd.to_datetime(events['event_start_date'])
     events['event_end_date'] = pd.to_datetime(events['event_end_date'])
     
-    # Ensure disposal_level exists (for fallback cases)
+    # Ensure disposal_level exists
     if 'disposal_level' not in events.columns:
-        # Fallback: simple mapping from boolean if available, else all 1
         if 'is_second_disposal' in events.columns:
             events['disposal_level'] = events.apply(lambda r: 2 if r['is_second_disposal'] else 1, axis=1)
         else:
             events['disposal_level'] = 1
+
+    # 3. [Logic Change] Map event dates to Trading Index using Vectorized searchsorted
+    # 此步驟將「每個事件的起始日/結束日」轉換為「該股票價格表中的索引位置 (Trading Index)」
+    # 這樣後續可以直接用整數索引來篩選 [T-3, T+N]，完全避開假日問題
     
-    # 3. 合併 (Cross Join logic but filtered)
-    # 由於一個股票可能有多個處置區間，且區間可能重疊，最好的方式是 merge 後過濾
-    # 先只 merge Stock_id
+    # Pre-compute price dates map for fast lookup
+    # prices is already sorted by Stock_id, Date
+    # We create a dictionary: Stock_id -> (Dates Array, TradingIndices Array)
+    price_dates_map = {}
+    for stock_id, grp in prices.groupby('Stock_id'):
+        price_dates_map[stock_id] = (grp['Date'].values, grp['trading_idx'].values)
+        
+    def get_event_indices(group):
+        stock = group.name
+        # Note: If grouping by column, name is the value of the key
+        
+        if stock not in price_dates_map:
+            # No price data for this stock
+            group['trading_idx_start'] = np.nan
+            group['trading_idx_end'] = np.nan
+            return group
+            
+        p_dates, p_idxs = price_dates_map[stock]
+        
+        # Start Index Search (Left side): Find insertion point for Start Date
+        # If Start Date is a holiday, this gives the NEXT trading day index (exactly what we want)
+        s_starts = np.searchsorted(p_dates, group['event_start_date'].values, side='left')
+        
+        # End Index Search (Right side - 1): Find insertion point for End Date
+        # If End Date is a holiday, 'right' gives next trading day. 
+        # But we want the period covering End Date. 
+        # If End Date=Sunday, we want up to Friday. searchsorted(Sun, right)=Mon_idx. Mon_idx-1 = Fri_idx. Correct.
+        s_ends = np.searchsorted(p_dates, group['event_end_date'].values, side='right') - 1
+        
+        # Handle Indices Out of Bounds
+        # 1. Start is after all data (s_starts >= len) -> Event is in future or missing data
+        # 2. End is before all data (s_ends < 0) -> Event is in past or missing data
+        
+        valid_start = s_starts < len(p_dates)
+        valid_end = s_ends >= 0
+        
+        # Initialize result with NaN
+        t_start = np.full(len(group), np.nan)
+        t_end = np.full(len(group), np.nan)
+        
+        # Clip for safe indexing
+        s_starts_clamped = np.clip(s_starts, 0, len(p_dates) - 1)
+        s_ends_clamped = np.clip(s_ends, 0, len(p_dates) - 1)
+        
+        # Map array index -> Trading Index (p_idxs)
+        # Note: p_idxs[i] is the trading_idx value at array position i
+        
+        # Fill valid values
+        # We need to be careful with boolean indexing on arrays vs Series
+        # Extract results first
+        val_starts = p_idxs[s_starts_clamped].astype(float)
+        val_ends = p_idxs[s_ends_clamped].astype(float)
+        
+        # Apply mask
+        val_starts[~valid_start] = np.nan
+        val_ends[~valid_end] = np.nan
+        
+        group['trading_idx_start'] = val_starts
+        group['trading_idx_end'] = val_ends
+        
+        return group
+
+    # Apply mapping
+    # Note: group_keys=False prevents index expansion
+    if not events.empty:
+        events = events.groupby('Stock_id', group_keys=False).apply(get_event_indices)
+    else:
+        events['trading_idx_start'] = np.nan
+        events['trading_idx_end'] = np.nan
+
+    # 4. 合併與篩選 (Merge and Filter)
     merged = pd.merge(prices, events, on='Stock_id', how='inner')
     
-    # 4. 過濾有效資料：保留在 [Start - offset, End + offset] 範圍內的列
-    # 注意：這裡 offset_days 必須與 fetch 時一致或更小
-    mask = (merged['Date'] >= merged['event_start_date'] - timedelta(days=offset_days)) & \
-           (merged['Date'] <= merged['event_end_date'] + timedelta(days=offset_days))
+    # 這裡的 offset_days 代表「前後 N 筆交易日」 (ex: 5 days means 5 candles)
+    # 而不再是日曆天
+    mask = (merged['trading_idx'] >= merged['trading_idx_start'] - offset_days) & \
+           (merged['trading_idx'] <= merged['trading_idx_end'] + offset_days)
     
     event_study_df = merged[mask].copy()
     
     # 5. 計算相對天數
-    # 這裡我們需要找到 event_start_date 對應的 trading_idx，才能算出 t+N
-    # 為了效能，我們建立一個 lookup table
-    # 找出每個 (Stock_id, Date) 的 trading_idx
-    trade_idx_map = prices.set_index(['Stock_id', 'Date'])['trading_idx']
+    # Calculate relative days based purely on Trading Index Diff
+    event_study_df['relative_day'] = (event_study_df['trading_idx'] - event_study_df['trading_idx_start'])
+    event_study_df['relative_day_end'] = (event_study_df['trading_idx'] - event_study_df['trading_idx_end'])
     
-    # 為每筆事件找出 Start Date 的 Trading Index
-    # 注意：Start Date 可能不是交易日，需用 searchsorted 或類似邏輯去找 "最近的交易日"
-    # 簡單做法：將 Event Start Date 對應到 Price Table (Merge left on Stock, Start Date)
-    # 但如果 Start Date 是假日，會對不起來。
-    # 改進：使用 merge_asof if sorted? 
-    # 或是由 event_study_df 中，針對每個 event_grp，找出 Date >= Start 的第一筆，設為 t=0
-    
-    # 讓我們用更簡單的邏輯：
-    # 已經有 trading_idx。對於每一行，我們知道它的 Date 和 event_start_date。
-    # 我們需要知道 event_start_date 當天的 trading_idx。
-    # 如果 event_start_date 是假日，通常處置開始日會是交易日。如果不幸是假日，取之後的第一個交易日。
-    
-    # 方法：
-    # 計算 `Date - StartDate` 的天數 (Calendar Days)
-    event_study_df['calendar_relative_day'] = (event_study_df['Date'] - event_study_df['event_start_date']).dt.days
-    
-    # 計算 Relative Trading Days
-    # 先找出每個 (Stock, EventStart) 的基準 Trading Index
-    # Step A: 找出所有 Event Start Date 在該股票 trading_idx 的位置
-    # 利用 prices 表
-    start_indices = prices.reset_index().merge(
-        events[['Stock_id', 'event_start_date']], 
-        left_on=['Stock_id', 'Date'], 
-        right_on=['Stock_id', 'event_start_date'],
-        how='right' # Keep all events
-    )
-    # 如果 StartDate 沒對到 (假日)，trading_idx 會是 NaN。需 Backfill。
-    # 但這裡我們只要有對到的就好，大部分處置起始日都是交易日。
-    # 為了嚴謹，若 Start Date 沒對到，我們似乎無法定義 t=0。
-    # 假設 Finlab 資料的處置起始日都是交易日。
-    start_idx_map = start_indices.dropna(subset=['trading_idx']).set_index(['Stock_id', 'event_start_date'])['trading_idx']
-    
-    # Also find End Date Trading Index for "e+N" labeling
-    end_indices = prices.reset_index().merge(
-        events[['Stock_id', 'event_end_date']],
-        left_on=['Stock_id', 'Date'],
-        right_on=['Stock_id', 'event_end_date'],
-        how='right'
-    )
-    end_idx_map = end_indices.dropna(subset=['trading_idx']).set_index(['Stock_id', 'event_end_date'])['trading_idx']
-
-    # Map back to main df
-    event_study_df = event_study_df.join(start_idx_map, on=['Stock_id', 'event_start_date'], rsuffix='_start')
-    event_study_df = event_study_df.join(end_idx_map, on=['Stock_id', 'event_end_date'], rsuffix='_end')
-    
-    # 計算 relative day (start based)
-    event_study_df['relative_day'] = event_study_df['trading_idx'] - event_study_df['trading_idx_start']
-    # relative day (end based)
-    event_study_df['relative_day_end'] = event_study_df['trading_idx'] - event_study_df['trading_idx_end']
-    
-    # 若有 NaN (表示起始日非交易日)，則無法計算精確 t，暫時填入 NaN 或移除
+    # Drop rows where start index was invalid (NaN)
     event_study_df = event_study_df.dropna(subset=['relative_day'])
     event_study_df['relative_day'] = event_study_df['relative_day'].astype(int)
-    # Note: relative_day_end might be NaN if end date is not trading day, but it's only critical for e+N labels which happen AFTER end date (should be valid trading days)
-
-
-    # [Removed] Old Interval-based Classification Logic 
-    # (Classification is now done in Step 2 based on continuity)
+    
+    # 計算日曆天 Gap (For reference)
+    event_study_df['calendar_relative_day'] = (event_study_df['Date'] - event_study_df['event_start_date']).dt.days
 
     # 6. 產生 t_label (s+N / e+N format)
     def generate_label(row):
-        # Check if Date is >= event_end_date (User request: End Date should be e+0)
-        # Logic: If current date is at or AFTER end date, use e+N
+        # 優先判斷是否已經過了解除日 (e+N)
+        # 邏輯：如果你在 End Date 之後 (trading_idx > trading_idx_end)，則算 e+
+        # 或者 Date >= Event End Date
         
-        # We can use trading_idx diff check or actual date check
-        # Date check is safer against index mapping issues
-        if row['Date'] >= row['event_end_date']:
+        # 使用 trading_idx 判斷最準
+        # 如果當天 index >= end index，則屬於 e+系列
+        # 但要注意：e+0 定義為「不處置的第一天」還是「處置最後一天」？
+        # 通常處置期間是 [Start, End]。
+        # 用戶指示：End Date should be e+0? 
+        # 之前的邏輯：`if row['Date'] >= row['event_end_date']` return e+
+        # 如果 End Date 是週五，週五當天符合 >= End Date。所以週五是 e+0?
+        # 如果週五是最後一天處置日，通常 e+0 是指「恢復正常的第一天」or 「最後一天」?
+        # 依照慣例，s+0 是開始第一天。
+        # 如果 End Date 是處置最後一天。那 End Date 當天應該還是處置中 (s+N)。
+        # 而 e+1 才是恢復正常。
+        # 但這取決於使用者習慣。
+        # (原代碼邏輯)：`if date >= end_date: e+...`
+        # 這樣 End Date 當天會變成 e+0 (因為 diff=0)。
+        # 我們維持原邏輯。
+        
+        idx_current = row['trading_idx']
+        idx_end = row['trading_idx_end']
+        
+        if idx_current >= idx_end:
             # e+N
-            # If relative_day_end is NaN (end date was holiday), we approximate:
-            # But usually we want clean trading days.
-            if pd.notna(row.get('relative_day_end')):
-                val = int(row['relative_day_end'])
-                # val should be >= 0 since Date >= EndDate
-                return f'e+{val}'
+            val = int(idx_current - idx_end)
+            return f'e+{val}'
             
-            # If logic fails or special case, fall through to s+
-            
-        # Default: s+N / s-N
+        # s+N / s-N
         val_s = int(row['relative_day'])
         if val_s >= 0:
             return f's+{val_s}'
@@ -483,78 +552,56 @@ def run_event_study(price_df, disposal_info, offset_days=3):
 
     t_label_series = event_study_df.apply(generate_label, axis=1)
     
-    # Split into two columns (Now safe to use is_first_disposal)
     # Split into columns dynamically based on level
-    # Map level number to suffix name
     level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
-    
     unique_levels = sorted(event_study_df['disposal_level'].unique())
     print(f"Detected Disposal Levels: {unique_levels}")
     
     for lvl in unique_levels:
-        suffix = level_map.get(lvl, f"level_{lvl}") # Fallback to level_5, level_6...
+        suffix = level_map.get(lvl, f"level_{lvl}")
         col_name = f't_label_{suffix}'
         event_study_df[col_name] = event_study_df.apply(
             lambda row: t_label_series[row.name] if row['disposal_level'] == lvl else None, axis=1
         )
     
-    
     # [Added] Capture Long Format Dataframe before pivoting
-    # This preserves all overlapping event rows for statistical usage per t-label/level
     long_df = event_study_df.copy()
     
-    # 7. 轉置為寬表格 (Wide Format) 以消除重複日期
+    # 7. 轉置為寬表格 (Wide Format)
     print("Converting to Wide Format...")
     
-    # A. 準備基礎價格表 (Base Price Data) - 確保唯一性
+    # A. 準備基礎價格表
     price_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
     base_cols = ['Date', 'Stock_id'] + price_cols
     df_base = event_study_df[base_cols].drop_duplicates(subset=['Date', 'Stock_id'])
     
     # B. 準備事件屬性欄位
-    # 這些欄位需要分流 (Split)
     event_attrs = ['condition', 'interval', 'event_start_date', 'event_end_date', 
-                   'relative_day', 'gap_days', 'calendar_relative_day']
-    # 僅保留實際存在的欄位
+                   'relative_day', 'gap_days', 'calendar_relative_day', 'trading_idx_start', 'trading_idx_end', 'relative_day_end']
     existing_attrs = [col for col in event_attrs if col in event_study_df.columns]
     
-    
-    # C. Dynamic Processing for each level
-    # Initialize final_df with base data
+    # C. Dynamic Processing
     final_df = df_base.copy()
     
-    # 處理每一個 Level
     for lvl in unique_levels:
         suffix = level_map.get(lvl, f"level_{lvl}")
-        
-        # Filter data for this level
         df_lvl = event_study_df[event_study_df['disposal_level'] == lvl].copy()
         
         if not df_lvl.empty:
-            # Deduplicate: Keep latest event start date
             df_lvl = df_lvl.sort_values('event_start_date').drop_duplicates(subset=['Date', 'Stock_id'], keep='last')
-            
-            # Rename columns
             rename_dict = {col: f"{col}_{suffix}" for col in existing_attrs}
-            
-            # Keep t_label column
             t_label_col = f't_label_{suffix}'
-            
             cols_to_keep = ['Date', 'Stock_id', t_label_col] + existing_attrs
             df_lvl = df_lvl[cols_to_keep].rename(columns=rename_dict)
-            
-            # Merge to final
             final_df = final_df.merge(df_lvl, on=['Date', 'Stock_id'], how='left')
         
-    # F. 最終整理
     final_df = final_df.sort_values(['Stock_id', 'Date'])
     
-    # Calculate returns for Long format (stats)
+    # Calculate returns for Long format
     long_df['daily_ret'] = (long_df['Close']/long_df['Open']) - 1 
     
-    # Wide format cleanup:
-    # User requested removing price data from wide format to keep it clean (signals only)
-    cols_to_drop = ['Open', 'High', 'Low', 'Close', 'Volume', 'daily_ret'] # daily_ret might not be in final_df yet
+    # Wide format cleanup
+    cols_to_drop = ['Open', 'High', 'Low', 'Close', 'Volume', 'daily_ret']
     valid_drop_cols = [c for c in cols_to_drop if c in final_df.columns]
     final_df = final_df.drop(columns=valid_drop_cols)
     
