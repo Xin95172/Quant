@@ -57,9 +57,21 @@ class DisposalAnalyzer:
             # Drop duplicates to get unique events
             unique_events = self.df.drop_duplicates(subset=['Stock_id', 'event_start_date'])
             event_counts = unique_events[col].value_counts().rename('event_count')
-            
+
+            extras = []
+            if 'interval' in unique_events.columns:
+                s_interval = unique_events['interval'].astype(str)
+
+                # 抓5分盤
+                c5 = unique_events[s_interval.str.contains('5')][col].value_counts().rename('5min_count')
+
+                # 抓20分盤
+                c20 = unique_events[s_interval.str.contains('20')][col].value_counts().rename('20min_count')
+                
+                extras = [c5, c20]
+
             # Combine
-            stats = pd.concat([days_counts, event_counts], axis=1).fillna(0).astype(int)
+            stats = pd.concat([days_counts, event_counts] + extras, axis=1).fillna(0).astype(int)
         else:
             # Fallback if metadata missing
             stats = pd.DataFrame(days_counts)
