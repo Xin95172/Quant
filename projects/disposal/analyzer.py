@@ -91,13 +91,18 @@ class DisposalAnalyzer:
             stats = stats.sort_values('days_count', ascending=False)
             
         # Display
+        # Display
         display_cols = [col, 'days_count', 'event_count', 'days_pct']
+        if '5min_count' in stats.columns:
+            display_cols.extend(['5min_count', '20min_count'])
+        
         if 'event_count' in stats.columns and stats['event_count'].dtype != 'O':
              # Format numbers
-             display(stats[display_cols].style.format({
-                 'days_count': '{:,}',
-                 'event_count': '{:,}'
-             }))
+             fmt = {'days_count': '{:,}', 'event_count': '{:,}'}
+             if '5min_count' in stats.columns:
+                 fmt.update({'5min_count': '{:,}', '20min_count': '{:,}'})
+                 
+             display(stats[display_cols].style.format(fmt))
         else:
              display(stats[display_cols])
 
