@@ -42,24 +42,52 @@ class DisposalAnalyzer:
         )
 
     def _display_dataframe(self, col: str, title: str):
-        """以 Pandas DataFrame 顯示分佈統計"""
+        """以 Pandas DataFrame 顯示分佈統計 (Days vs Events)"""
         if col not in self.df.columns:
             return
             
         print(f"\n[{title}]")
-        counts = self.df[col].value_counts().reset_index()
-        counts.columns = [col, 'Count']
         
-        # Add Percentage
-        total = len(self.df)
-        counts['Percentage'] = (counts['Count'] / total * 100).map('{:.2f}%'.format)
+        # 1. Days Count (Rows)
+        days_counts = self.df[col].value_counts().rename('days_count')
         
-        # Sort if numerical (like disposal_level)
-        if pd.api.types.is_numeric_dtype(counts[col]):
-            counts = counts.sort_values(col)
+        # 2. Event Count (Unique Events)
+        # 只有當 'Stock_id' 和 'event_start_date' 存在時才能算
+        if 'Stock_id' in self.df.columns and 'event_start_date' in self.df.columns:
+            # Drop duplicates to get unique events
+            unique_events = self.df.drop_duplicates(subset=['Stock_id', 'event_start_date'])
+            event_counts = unique_events[col].value_counts().rename('event_count')
             
-        # Display standard dataframe
-        display(counts)
+            # Combine
+            stats = pd.concat([days_counts, event_counts], axis=1).fillna(0).astype(int)
+        else:
+            # Fallback if metadata missing
+            stats = pd.DataFrame(days_counts)
+            stats['event_count'] = 'N/A'
+            
+        stats.index.name = col
+        stats = stats.reset_index()
+        
+        # Percentage (based on Days)
+        total_days = len(self.df)
+        stats['days_pct'] = (stats['days_count'] / total_days * 100).map('{:.2f}%'.format)
+        
+        # Sort
+        if pd.api.types.is_numeric_dtype(stats[col]):
+            stats = stats.sort_values(col)
+        else:
+            stats = stats.sort_values('days_count', ascending=False)
+            
+        # Display
+        display_cols = [col, 'days_count', 'event_count', 'days_pct']
+        if 'event_count' in stats.columns and stats['event_count'].dtype != 'O':
+             # Format numbers
+             display(stats[display_cols].style.format({
+                 'days_count': '{:,}',
+                 'event_count': '{:,}'
+             }))
+        else:
+             display(stats[display_cols])
 
     def overall_analysis(self, min_samples: int = 50, prefix: str = 't_label_'):
         """
@@ -73,40 +101,64 @@ class DisposalAnalyzer:
         self._display_dataframe('condition', 'Disposal Condition Distribution')
 
         if 'disposal_level' in self.df.columns:
-            self._display_dataframe('disposal_level', 'Disposal Level Distribution')
 
-            # Visualization for Disposal Level (Effect Analysis)
+            # Correct Event Count Logic
+            # Days Count: Number of rows (trading days)
+            # Event Count: Number of distinct events (identified by 's+0' marker in corresponding t_label column)
+            
+            # 1. Calculate basic stats (based on Days)
             level_stats = self.df.groupby('disposal_level')['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
-            # Ensure sorting by level
+            level_stats = level_stats.rename(columns={'count': 'days_count'})
+            
+            # 2. Calculate true Event Count
+            event_counts = {}
+            unique_levels = self.df['disposal_level'].dropna().unique()
+            level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
+            
+            for lvl in unique_levels:
+                # Find the column that represents this level's timing
+                suffix = level_map.get(lvl, f"level_{int(lvl)}")
+                t_col = f"t_label_{suffix}"
+                
+                if t_col in self.df.columns:
+                    # Count how many times 's+0' appears for this level
+                    # This assumes 's+0' is present for every event. If data is truncated, this might undercount,
+                    # but it's the most accurate proxy available in the Wide format.
+                    # We filter by disposal_level to ensure we are looking at the right rows
+                    count = self.df[
+                        (self.df['disposal_level'] == lvl) & 
+                        (self.df[t_col] == 's+0')
+                    ].shape[0]
+                    event_counts[lvl] = count
+                else:
+                    event_counts[lvl] = 0
+            
+            # Map event counts back to stats
+            level_stats['event_count'] = level_stats['disposal_level'].map(event_counts).fillna(0).astype(int)
+            
+            # Sort
             level_stats = level_stats.sort_values('disposal_level')
+            
+            # Display readable table
+            print("\n[Disposal Level Statistics]")
+            display_cols = ['disposal_level', 'days_count', 'event_count', 'mean', 'std']
+            display(level_stats[display_cols].style.format({
+                'mean': '{:.2%}', 
+                'std': '{:.2%}',
+                'days_count': '{:,}',
+                'event_count': '{:,}'
+            }))
+
             
             plot(
                 df=level_stats,
                 x='disposal_level',
                 ly='mean',       # Top: Mean Daily Return
-                bar_col='count', # Bottom: Sample Count
+                bar_col='days_count', # Bottom: Days Count (more relevant for significance)
                 ly_type='bar',
-                note="Disposal Effect by Level (1=First, 2=Second...)",
+                note="Disposal Effect by Level",
                 bar_kwargs={'width': 0.8}
             )
-
-        t_cols = [c for c in self.df.columns if c.startswith(prefix)]
-        print(f"Found {len(t_cols)} levels with prefix '{prefix}'")
-
-        for target_col in t_cols:
-            # Check sample size
-            valid_count = self.df[target_col].notna().sum()
-            if valid_count < min_samples:
-                continue
-
-            # Statistics
-            stats = self.df.groupby(target_col)['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
-            
-            # Plot
-            self._plot_stats(stats, target_col, note=f"Disposal Effect: {target_col}")
-
-
-
 
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
