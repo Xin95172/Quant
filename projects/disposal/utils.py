@@ -156,7 +156,7 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
         # Wrap API call to catch FinMind's KeyError: 'data'
         try:
             client.initialize_frame(stock_id=stock_id, start_time=start_str, end_time=end_str)
-            price_df = client.get_stock_price()
+            price_df = client.get_stock()
         except KeyError:
             # FinMind returns KeyError 'data' if no data found or API error (Token/Limit)
             print(f"[Warning] FinMind API returned no data for {stock_id}. This usually indicates an INVALID TOKEN or RATE LIMIT reached.")
