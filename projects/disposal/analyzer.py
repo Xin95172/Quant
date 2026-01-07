@@ -10,6 +10,9 @@ class DisposalAnalyzer:
     """
     def __init__(self, df: pd.DataFrame):
         self.df = df
+    
+    def display_dataframe(self):
+        display(self.df)
 
     @staticmethod
     def _parse_t_val(t_str: str) -> int:
@@ -166,7 +169,6 @@ class DisposalAnalyzer:
                 'event_count': '{:,}'
             }))
 
-            
             plot(
                 df=level_stats,
                 x='disposal_level',
@@ -177,6 +179,74 @@ class DisposalAnalyzer:
                 bar_kwargs={'width': 0.8}
             )
 
+    def seprate_by_raisefall(self):
+        """
+        比較處置原因：利用 s-2 至 s+0 的累積漲跌幅區分超漲 (Overbought) / 超跌 (Oversold)
+        """
+        if self.df.empty:
+            print("Dataframe is empty. Please check data source.")
+            return
+
+        required_cols = ['Stock_id', 'event_start_date', 'daily_ret', 'disposal_level']
+        if not all(col in self.df.columns for col in required_cols):
+             print(f"缺少必要欄位 {required_cols}，無法進行趨勢分析。")
+             return
+
+        # 準備方向判斷
+        event_trends = []
+
+        unique_levels = self.df['disposal_level'].dropna().unique()
+        level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
+        
+        for lvl in unique_levels:
+            suffix = level_map.get(lvl, f"level_{int(lvl)}")
+            t_col = f"t_label_{suffix}"
+            if t_col not in self.df.columns: continue
+            
+            # 取出該層級 s-2 到 s+0 的資料
+            mask = (self.df['disposal_level'] == lvl) & (self.df[t_col].isin(['s-2', 's-1', 's+0']))
+            subset = self.df.loc[mask, ['Stock_id', 'event_start_date', 'daily_ret']].copy()
+            
+            if subset.empty: continue
+
+            # 計算這段期間的累積報酬 (簡單加總 daily_ret)
+            grouped = subset.groupby(['Stock_id', 'event_start_date'])['daily_ret'].sum().reset_index()
+            grouped['direction'] = grouped['daily_ret'].apply(
+                lambda x: 'Overbought' if x > 0 else 'Oversold'
+            )
+            event_trends.append(grouped[['Stock_id', 'event_start_date', 'direction']])
+            
+        if not event_trends:
+            print("無法計算趨勢 (找不到 s-2 ~ s+0 的時間標籤資料)")
+            return
+            
+        # 合併所有事件的判斷結果
+        all_trends = pd.concat(event_trends, ignore_index=True)
+        
+        # 將判斷結果 Merge 回主表
+        # 若已存在 direction 則先移除，避免重複
+        if 'direction' in self.df.columns:
+            self.df = self.df.drop(columns=['direction'])
+            
+        self.df = self.df.merge(all_trends, on=['Stock_id', 'event_start_date'], how='left')
+        self.df['direction'] = self.df['direction'].fillna('未知 (Unknown)')
+        
+        # 1. 顯示基本分佈 (Days & Events)
+        self._display_dataframe('direction', '處置前趨勢分佈 (s-2 ~ s+0)')
+
+        # 2. 交叉分析
+        if 'disposal_level' in self.df.columns:
+            print("\n[方向 vs 層級 交叉表 (交易天數)]")
+            ct = pd.crosstab(
+                self.df['direction'], 
+                self.df['disposal_level'],
+                margins=True,
+                margins_name='Total'
+            )
+            display(ct)
+
+        display(self.df)
+            
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
     analyzer = DisposalAnalyzer(df)
