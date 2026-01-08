@@ -179,7 +179,7 @@ class DisposalAnalyzer:
                 bar_kwargs={'width': 0.8}
             )
 
-    def seprate_by_raisefall(self):
+    def seprate_by_trend(self):
         """
         比較處置原因：利用 s-2 至 s+0 的累積漲跌幅區分超漲 (Overbought) / 超跌 (Oversold)
         """
@@ -217,36 +217,169 @@ class DisposalAnalyzer:
             event_trends.append(grouped[['Stock_id', 'event_start_date', 'direction']])
             
         if not event_trends:
-            print("無法計算趨勢 (找不到 s-2 ~ s+0 的時間標籤資料)")
+            print("找不到 s-2 ~ s+0 的時間標籤資料")
             return
             
         # 合併所有事件的判斷結果
         all_trends = pd.concat(event_trends, ignore_index=True)
         
         # 將判斷結果 Merge 回主表
-        # 若已存在 direction 則先移除，避免重複
         if 'direction' in self.df.columns:
             self.df = self.df.drop(columns=['direction'])
             
         self.df = self.df.merge(all_trends, on=['Stock_id', 'event_start_date'], how='left')
-        self.df['direction'] = self.df['direction'].fillna('未知 (Unknown)')
+        self.df['direction'] = self.df['direction'].fillna('Unknown')
         
-        # 1. 顯示基本分佈 (Days & Events)
+        # 1. 顯示基本分佈
         self._display_dataframe('direction', '處置前趨勢分佈 (s-2 ~ s+0)')
 
         # 2. 交叉分析
         if 'disposal_level' in self.df.columns:
             print("\n[方向 vs 層級 交叉表 (交易天數)]")
             ct = pd.crosstab(
-                self.df['direction'], 
+                self.df['direction'],
                 self.df['disposal_level'],
                 margins=True,
                 margins_name='Total'
             )
             display(ct)
 
-        display(self.df)
+        # 3. 針對不同方向計算每日平均報酬並繪圖 (同標的連續處置合併)
+        print("\n[每日報酬率分析 (Daily Return Analysis) - Consecutive Merged]")
+
+        if 't_label_first' not in self.df.columns:
+            print("缺少 t_label_first 欄位，無法定位處置起點。")
+            return
             
+        # 建立臨時 Index 用於計算相對天數
+        self.df['__tmpidx'] = range(len(self.df))
+        
+        # 1. 識別連續處置區塊 (Chains)
+        # [修正] 使用日期區間來判定是否真正處於「處置中」
+        # disposal_level 只是事件編號，不能用來過濾日期
+        
+        # 確保日期格式正確 (與 pandas 相容)
+        for col in ['Date', 'event_start_date', 'event_end_date']:
+            if col in self.df.columns and not pd.api.types.is_datetime64_any_dtype(self.df[col]):
+                self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+
+        # 條件 A: 當天日期落在處置起始與結束日期之間 (Active Disposal)
+        if 'event_start_date' in self.df.columns and 'event_end_date' in self.df.columns and 'Date' in self.df.columns:
+            cond_in_disposal = (self.df['Date'] >= self.df['event_start_date']) & (self.df['Date'] <= self.df['event_end_date'])
+        else:
+            # Fallback (不太可能發生，除非 csv 欄位不對)
+            print("Warning: Missing date columns for active disposal check. using disposal_level fallback.")
+            cond_in_disposal = (self.df['disposal_level'].notna()) & (self.df['disposal_level'] > 0)
+
+        # 條件 B: 是第一次處置的 s-2, s-1 (前置觀察期)
+        cond_pre_days = self.df['t_label_first'].isin(['s-2', 's-1'])
+            
+        is_event = cond_in_disposal | cond_pre_days
+        
+        # 偵測斷點：Stock 不同 OR 是否為處置日的狀態改變
+        group_change = (is_event != is_event.shift(1)) | (self.df['Stock_id'] != self.df['Stock_id'].shift(1))
+        self.df['__group_id'] = group_change.cumsum()
+        
+        # 只取處置區塊的資料
+        valid_mask = is_event
+        # 複製出來處理，避免影響原始 df
+        cols_to_keep = ['Stock_id', 'Date', 'disposal_level', 'direction', 'daily_ret', 
+                        't_label_first', '__group_id', 'event_start_date']
+        valid_rows = self.df.loc[valid_mask, cols_to_keep].copy()
+        
+        # [新增] 去除重複日期 (Deduplicate)
+        # 因為 L1 和 L2 的時間可能重疊，導致同一天有兩筆資料 (一筆 L1, 一筆 L2)
+        # 我們只保留一筆 (keep='first' 隨著原始排序通常保留 L1 或較早開始的事件)
+        valid_rows = valid_rows.sort_values(by=['Stock_id', 'Date', 'disposal_level']) # 確保排序穩定
+        valid_rows = valid_rows.drop_duplicates(subset=['Stock_id', 'Date'], keep='first')
+
+        # 準備欄位
+        valid_rows['unified_t_label'] = None
+        valid_rows['unified_direction'] = None
+        
+        # 以 Group 為單位進行處理
+        results = []
+        
+        for gid, group_df in valid_rows.groupby('__group_id'):
+            # 必須重新因為 Date 排序，確保時間軸正確
+            group_df = group_df.sort_values('Date')
+            
+            # 定位 Anchor (L1 s+0)
+            # 優先找 t_label_first == 's+0'
+            anchor_rows = group_df[group_df['t_label_first'] == 's+0']
+            
+            if not anchor_rows.empty:
+                anchor_row = anchor_rows.iloc[0]
+                # 取得該 Group 統一的趨勢方向
+                main_direction = anchor_row['direction']
+                
+                # 計算時間軸
+                anchor_idx = group_df.index.get_loc(anchor_row.name) # get integer location
+                
+                # Assign distinct values
+                group_df['unified_direction'] = main_direction
+                
+                # 建立相對天數 (t_int)
+                n_rows = len(group_df)
+                t_ints = range(n_rows)
+                rel_t = [t - anchor_idx for t in t_ints]
+                
+                # 轉成 t_label 字串
+                def to_label(val):
+                    if val == 0: return 's+0'
+                    if val < 0: return f"s{val}"
+                    return f"s+{val}"
+                
+                group_df['unified_t_label'] = [to_label(x) for x in rel_t]
+                
+                results.append(group_df)
+            else:
+                continue
+                
+        if results:
+            final_df = pd.concat(results)
+            
+            # 繪圖
+            _plot_cols = ['daily_ret']
+            direction_order = ['Overbought', 'Oversold']
+            
+            # 聚合計算 Mean & Count
+            # Group by (Time, Direction)
+            stats = final_df.groupby(['unified_t_label', 'unified_direction'])['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
+            
+            # 8. 繪圖
+            # 由於 _plot_stats 只支援單一序列繪圖 (Hardcoded ly='mean')，
+            # 我們這裡透過迴圈分別畫出 Overbought 和 Oversold 的圖表，而不是畫在同一張圖上
+            print(f"\n[繪圖] 產出 {len(direction_order)}張圖表 (Overbought/Oversold)...")
+            
+            for direction in direction_order:
+                # 篩選對應方向的數據
+                subset = stats[stats['unified_direction'] == direction].copy()
+                
+                if subset.empty:
+                    print(f"Skipping {direction}: No data.")
+                    continue
+                
+                print(f" -> Plotting {direction} (Data points: {len(subset)})")
+                
+                # 呼叫既有的 _plot_stats (它會自動排序並畫 mean/count)
+                self._plot_stats(
+                    stats=subset, 
+                    target_col='unified_t_label', 
+                    note=f"Daily Return Trajectory - {direction} (Consecutive Merged)"
+                )
+            
+        else:
+            print("No valid consecutive disposal groups found (with s+0 anchor).")
+            
+        # 清理暫存
+        if '__tmpidx' in self.df.columns:
+            del self.df['__tmpidx']
+        if '__group_id' in self.df.columns:
+            del self.df['__group_id']
+        
+        results.to_csv('test.csv', index=False)
+
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
     analyzer = DisposalAnalyzer(df)
