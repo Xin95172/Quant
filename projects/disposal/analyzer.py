@@ -250,9 +250,6 @@ class DisposalAnalyzer:
         if 't_label_first' not in self.df.columns:
             print("缺少 t_label_first 欄位，無法定位處置起點。")
             return
-            
-        # 建立臨時 Index 用於計算相對天數
-        self.df['__tmpidx'] = range(len(self.df))
 
         # merge 連續處置
         final_df = self.df.copy()
