@@ -253,7 +253,7 @@ class DisposalAnalyzer:
         # merge 連續處置
         final_df = self.df.copy()
         final_df = final_df.drop_duplicates(subset=['Date', 'Stock_id'])
-        final_df = final_df.dropna(subset='t_label_first')
+        final_df.to_csv('test.csv')
         
         return final_df
 
