@@ -244,16 +244,92 @@ class DisposalAnalyzer:
             )
             display(ct)
         
-        # 3. 針對不同方向計算每日平均報酬並繪圖 (同標的連續處置合併)
 
-        if 't_label_first' not in self.df.columns:
-            print("缺少 t_label_first 欄位，無法定位處置起點。")
-            return
+        
+        # 重新定義 "t_label"
+        # 邏輯：
+        # 1. 識別連續處置事件
+        # 2. 定義區間：
+        #    - Start Date: 該組中 Level 最小 (通常是1) 的 event_start_date -> s+0
+        #    - End Date:   該組中 Level 最大 (通常是處置最後層級) 的 event_end_date -> e+0
+        # 3. 標籤規則：
+        #    - 若日期 < End Date: 標記為 s 系列 (相對於 Start Date)
+        #    - 若日期 >= End Date: 標記為 e 系列 (相對於 End Date, 當天為 e+0)
+        
+        df_process = self.df.copy()
+        df_process.drop_duplicates(subset=['Date', 'Stock_id'], inplace=True)
+        if 'Date' not in df_process.columns:
+             df_process['Date'] = pd.to_datetime(df_process['Date'])
 
-        # merge 連續處置
-        final_df = self.df.copy()
-        final_df = final_df.drop_duplicates(subset=['Date', 'Stock_id'])
-        final_df.to_csv('test.csv')
+        # 排序：Stock -> Date
+        df_process = df_process.sort_values(['Stock_id', 'Date'])
+        
+        # 生成分組 Group ID (同前次邏輯)
+        df_process['prev_stock'] = df_process['Stock_id'].shift(1)
+        df_process['prev_level'] = df_process['disposal_level'].shift(1)
+        df_process['prev_end'] = df_process['event_end_date'].shift(1)
+        
+        cond_stock_change = df_process['Stock_id'] != df_process['prev_stock']
+        is_level_1 = df_process['disposal_level'] == 1
+        prev_not_1 = df_process['prev_level'] != 1
+        end_date_diff = df_process['event_end_date'] != df_process['prev_end']
+        cond_new_event = is_level_1 & (prev_not_1 | end_date_diff)
+        
+        df_process['new_group'] = cond_stock_change | cond_new_event
+        df_process['group_id'] = df_process['new_group'].cumsum()
+        
+        # 取得每個 Group 的 Start (Min Level) 與 End (Max Level) 日期
+        def get_dates(x):
+            start_date = x.loc[x['disposal_level'].idxmin(), 'event_start_date']
+            end_date = x.loc[x['disposal_level'].idxmax(), 'event_end_date']
+            return pd.Series({'base_start_date': start_date, 'base_end_date': end_date})
+
+        group_dates = df_process.groupby('group_id').apply(get_dates)
+        df_process = df_process.merge(group_dates, on='group_id', how='left')
+                
+        # 1. 計算該 Group 內的 Row Index (第幾筆交易)
+        df_process['group_row_idx'] = df_process.groupby('group_id').cumcount()
+        
+        # 2. 找出 Base Start Date 與 Base End Date 在該 Group 對應的 Index
+        df_process['base_start_date'] = pd.to_datetime(df_process['base_start_date'])
+        df_process['base_end_date'] = pd.to_datetime(df_process['base_end_date'])
+        
+        # 找出 Start Index
+        start_indices = df_process[df_process['Date'] == df_process['base_start_date']][['group_id', 'group_row_idx']]
+        start_indices = start_indices.rename(columns={'group_row_idx': 'base_start_idx'})
+        # 避免重複 (理論上同 Group 同 Date 已經由 drop_duplicates 濾除，但保險起見)
+        start_indices = start_indices.drop_duplicates(subset=['group_id'])
+        
+        # 找出 End Index
+        end_indices = df_process[df_process['Date'] == df_process['base_end_date']][['group_id', 'group_row_idx']]
+        end_indices = end_indices.rename(columns={'group_row_idx': 'base_end_idx'})
+        end_indices = end_indices.drop_duplicates(subset=['group_id'])
+        
+        # Merge 指標回主表
+        df_process = df_process.merge(start_indices, on='group_id', how='left')
+        df_process = df_process.merge(end_indices, on='group_id', how='left')
+        
+        # 3. 計算 Diff 並產生 Label
+        def format_t_label_trading_days(row):
+            # 優先檢查是否進入 'e' 系列 (>= End Index)
+            if pd.notna(row['base_end_idx']):
+                if row['group_row_idx'] >= row['base_end_idx']:
+                    diff = int(row['group_row_idx'] - row['base_end_idx'])
+                    return f"e+{diff}"
+            
+            # 計算 's' 系列
+            if pd.notna(row['base_start_idx']):
+                diff = int(row['group_row_idx'] - row['base_start_idx'])
+                return f"s{'+' if diff >= 0 else ''}{diff}"
+                
+            return None
+
+        df_process['t_label_reordered'] = df_process.apply(format_t_label_trading_days, axis=1)
+        
+        final_df = df_process.drop(columns=[
+            'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
+            'group_row_idx', 'base_start_idx', 'base_end_idx'
+        ])
         
         return final_df
 
@@ -271,7 +347,16 @@ class DisposalAnalyzer:
             df['daily_ret'] = (df['Close'] / df['Close'].shift(1)) - 1
 
         # 計算統計數據：依據方向與時間標籤分組
-        trend_stats = df.groupby(['direction', 't_label_first'])['daily_ret'].agg(['mean', 'count']).reset_index()
+        # 計算統計數據：依據方向與時間標籤分組
+        target_col = 't_label_reordered'
+        if target_col not in df.columns:
+             target_col = 't_label_first'
+
+        if target_col not in df.columns:
+            print(f"缺少 {target_col}，無法繪圖")
+            return
+
+        trend_stats = df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'count']).reset_index()
         
         # 分別繪圖
         for direction in ['Overbought', 'Oversold']:
@@ -284,7 +369,7 @@ class DisposalAnalyzer:
             # 繪圖
             self._plot_stats(
                 stats, 
-                target_col='t_label_first', 
+                target_col=target_col, 
                 note=f'{direction} - Daily Return - {session}'
             )
 
