@@ -245,7 +245,7 @@ class DisposalAnalyzer:
             display(ct)
         
         # 3. 針對不同方向計算每日平均報酬並繪圖 (同標的連續處置合併)
-        print("\n[每日報酬率分析 (Daily Return Analysis) - Consecutive Merged]")
+        print("\n[Daily Return Analysis - Consecutive Merged]")
 
         if 't_label_first' not in self.df.columns:
             print("缺少 t_label_first 欄位，無法定位處置起點。")
@@ -254,6 +254,10 @@ class DisposalAnalyzer:
         # merge 連續處置
         final_df = self.df.copy()
         final_df = final_df.drop_duplicates(subset=['Date', 'Stock_id'])
+        
+        # 算平均日報酬
+        final_df
+
         final_df.to_csv('test.csv', index=False)
 
 # Backward compatibility
