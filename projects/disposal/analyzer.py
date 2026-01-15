@@ -245,7 +245,6 @@ class DisposalAnalyzer:
             display(ct)
         
         # 3. 針對不同方向計算每日平均報酬並繪圖 (同標的連續處置合併)
-        print("\n[Daily Return Analysis - Consecutive Merged]")
 
         if 't_label_first' not in self.df.columns:
             print("缺少 t_label_first 欄位，無法定位處置起點。")
@@ -254,11 +253,30 @@ class DisposalAnalyzer:
         # merge 連續處置
         final_df = self.df.copy()
         final_df = final_df.drop_duplicates(subset=['Date', 'Stock_id'])
+        final_df = final_df.dropna(subset='t_label_first')
         
-        # 算平均日報酬
-        final_df
+        # 算平均日報酬並繪圖
+        print("\n[Daily Return Analysis - Consecutive Merged]")
 
-        final_df.to_csv('test.csv', index=False)
+        # 計算統計數據：依據方向與時間標籤分組
+        trend_stats = final_df.groupby(['direction', 't_label_first'])['daily_ret'].agg(['mean', 'count']).reset_index()
+        
+        # 分別繪圖
+        for direction in ['Overbought', 'Oversold']:
+            print(f"\n[{direction} Trend Analysis]")
+            
+            # 篩選該方向數據
+            stats = trend_stats[trend_stats['direction'] == direction].copy()
+            if stats.empty:
+                print(f"No data for {direction}")
+                continue
+                
+            # 繪圖
+            self._plot_stats(
+                stats, 
+                target_col='t_label_first', 
+                note=f'{direction} - Daily Return'
+            )
 
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
