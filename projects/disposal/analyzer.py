@@ -338,14 +338,28 @@ class DisposalAnalyzer:
         """
         繪製不同趨勢下的每日平均報酬 (Daily Return)
         """
+        # 決定分組欄位：優先使用合併後的 base_start_date，其次用 event_start_date
+        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
+        if 'base_start_date' not in df.columns:
+            print("少了 base_start_date")
+        if 'event_start_date' not in df.columns:
+            print("少了 base_end_date")
+        
         if session == 'position':
-            pass
+            # 日盤：開盤 -> 收盤 (當日)
+            df['daily_ret'] = (df['Close'] / df['Open']) - 1
         elif session == 'after_market':
-            print("跟台指期一樣，夜盤在日盤前面")
-            df['daily_ret'] = (df['Open'] / df['Close'].shift(1)) - 1
+            # 夜盤：前收 -> 今開 (需分組 shift)
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Open'] / df['prev_close']) - 1
         elif session == 'all':
-            print("跟台指期一樣，夜盤在日盤前面")
-            df['daily_ret'] = (df['Close'] / df['Close'].shift(1)) - 1
+            # 全日：前收 -> 今收 (需分組 shift)
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Close'] / df['prev_close']) - 1
+            
+        # 移除暫存欄位
+        if 'prev_close' in df.columns:
+            df.drop(columns=['prev_close'], inplace=True)
 
         target_col = 't_label'
         if target_col not in df.columns:
