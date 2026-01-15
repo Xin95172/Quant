@@ -284,7 +284,7 @@ class DisposalAnalyzer:
             end_date = x.loc[x['disposal_level'].idxmax(), 'event_end_date']
             return pd.Series({'base_start_date': start_date, 'base_end_date': end_date})
 
-        group_dates = df_process.groupby('group_id').apply(get_dates)
+        group_dates = df_process.groupby('group_id').apply(get_dates, include_groups=False)
         df_process = df_process.merge(group_dates, on='group_id', how='left')
                 
         # 1. 計算該 Group 內的 Row Index (第幾筆交易)
@@ -311,7 +311,7 @@ class DisposalAnalyzer:
         
         # 3. 計算 Diff 並產生 Label
         def format_t_label_trading_days(row):
-            # 優先檢查是否進入 'e' 系列 (>= End Index)
+            # 'e' 系列 (>= End Index)
             if pd.notna(row['base_end_idx']):
                 if row['group_row_idx'] >= row['base_end_idx']:
                     diff = int(row['group_row_idx'] - row['base_end_idx'])
@@ -324,12 +324,13 @@ class DisposalAnalyzer:
                 
             return None
 
-        df_process['t_label_reordered'] = df_process.apply(format_t_label_trading_days, axis=1)
+        df_process['t_label'] = df_process.apply(format_t_label_trading_days, axis=1)
         
         final_df = df_process.drop(columns=[
             'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
             'group_row_idx', 'base_start_idx', 'base_end_idx'
         ])
+        final_df.to_csv('test.csv')
         
         return final_df
 
@@ -346,9 +347,7 @@ class DisposalAnalyzer:
             print("跟台指期一樣，夜盤在日盤前面")
             df['daily_ret'] = (df['Close'] / df['Close'].shift(1)) - 1
 
-        # 計算統計數據：依據方向與時間標籤分組
-        # 計算統計數據：依據方向與時間標籤分組
-        target_col = 't_label_reordered'
+        target_col = 't_label'
         if target_col not in df.columns:
              target_col = 't_label_first'
 
