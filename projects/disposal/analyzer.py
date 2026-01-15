@@ -255,16 +255,26 @@ class DisposalAnalyzer:
         final_df = final_df.drop_duplicates(subset=['Date', 'Stock_id'])
         final_df = final_df.dropna(subset='t_label_first')
         
-        # 算平均日報酬並繪圖
-        print("\n[Daily Return Analysis - Consecutive Merged]")
+        return final_df
+
+    def plot_trend_return(self, df: pd.DataFrame, session: str = 'position'):
+        """
+        繪製不同趨勢下的每日平均報酬 (Daily Return)
+        """
+        if session == 'position':
+            pass
+        elif session == 'after_market':
+            print("跟台指期一樣，夜盤在日盤前面")
+            df['daily_ret'] = (df['Open'] / df['Close'].shift(1)) - 1
+        elif session == 'all':
+            print("跟台指期一樣，夜盤在日盤前面")
+            df['daily_ret'] = (df['Close'] / df['Close'].shift(1)) - 1
 
         # 計算統計數據：依據方向與時間標籤分組
-        trend_stats = final_df.groupby(['direction', 't_label_first'])['daily_ret'].agg(['mean', 'count']).reset_index()
+        trend_stats = df.groupby(['direction', 't_label_first'])['daily_ret'].agg(['mean', 'count']).reset_index()
         
         # 分別繪圖
         for direction in ['Overbought', 'Oversold']:
-            print(f"\n[{direction} Trend Analysis]")
-            
             # 篩選該方向數據
             stats = trend_stats[trend_stats['direction'] == direction].copy()
             if stats.empty:
@@ -275,8 +285,9 @@ class DisposalAnalyzer:
             self._plot_stats(
                 stats, 
                 target_col='t_label_first', 
-                note=f'{direction} - Daily Return'
+                note=f'{direction} - Daily Return - {session}'
             )
+
 
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
