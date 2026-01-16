@@ -181,7 +181,7 @@ class DisposalAnalyzer:
 
     def seprate_by_trend(self):
         """
-        比較處置原因：利用 s-2 至 s+0 的累積漲跌幅區分超漲 (Overbought) / 超跌 (Oversold)
+        比較處置原因：利用 s-3 至 s-1 的累積漲跌幅區分超漲 (Overbought) / 超跌 (Oversold)
         """
         if self.df.empty:
             print("Dataframe is empty. Please check data source.")
@@ -203,21 +203,24 @@ class DisposalAnalyzer:
             t_col = f"t_label_{suffix}"
             if t_col not in self.df.columns: continue
             
-            # 取出該層級 s-2 到 s+0 的資料
-            mask = (self.df['disposal_level'] == lvl) & (self.df[t_col].isin(['s-2', 's-1', 's+0']))
+            # 取出該層級 s-3 到 s-1 的資料
+            mask = (self.df['disposal_level'] == lvl) & (self.df[t_col].isin(['s-3', 's-2', 's-1']))
             subset = self.df.loc[mask, ['Stock_id', 'event_start_date', 'daily_ret']].copy()
             
             if subset.empty: continue
 
-            # 計算這段期間的累積報酬 (簡單加總 daily_ret)
-            grouped = subset.groupby(['Stock_id', 'event_start_date'])['daily_ret'].sum().reset_index()
-            grouped['direction'] = grouped['daily_ret'].apply(
+            # 計算這段期間的累積報酬 (複利計算：(1+r1)*(1+r2)... - 1)
+            grouped = subset.groupby(['Stock_id', 'event_start_date'])['daily_ret'].apply(
+                lambda x: (1 + x).prod() - 1
+            ).reset_index().rename(columns={'daily_ret': 'cum_ret'})
+            
+            grouped['direction'] = grouped['cum_ret'].apply(
                 lambda x: 'Overbought' if x > 0 else 'Oversold'
             )
             event_trends.append(grouped[['Stock_id', 'event_start_date', 'direction']])
             
         if not event_trends:
-            print("找不到 s-2 ~ s+0 的時間標籤資料")
+            print("找不到 s-3 ~ s-1 的時間標籤資料")
             return
             
         # 合併所有事件的判斷結果
@@ -231,7 +234,7 @@ class DisposalAnalyzer:
         self.df['direction'] = self.df['direction'].fillna('Unknown')
         
         # 1. 顯示基本分佈
-        self._display_dataframe('direction', '處置前趨勢分佈 (s-2 ~ s+0)')
+        self._display_dataframe('direction', '處置前趨勢分佈 (s-3 ~ s-1)')
 
         # 2. 交叉分析
         if 'disposal_level' in self.df.columns:
