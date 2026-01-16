@@ -202,22 +202,23 @@ class DisposalAnalyzer:
             suffix = level_map.get(lvl, f"level_{int(lvl)}")
             t_col = f"t_label_{suffix}"
             if t_col not in self.df.columns: continue
+            # 分別取出 s-3 (Open) 與 s-1 (Close)
+            mask_s3 = (self.df['disposal_level'] == lvl) & (self.df[t_col] == 's-3')
+            df_s3 = self.df.loc[mask_s3, ['Stock_id', 'event_start_date', 'Open']].rename(columns={'Open': 'Open_s3'})
             
-            # 取出該層級 s-3 到 s-1 的資料
-            mask = (self.df['disposal_level'] == lvl) & (self.df[t_col].isin(['s-3', 's-2', 's-1']))
-            subset = self.df.loc[mask, ['Stock_id', 'event_start_date', 'daily_ret']].copy()
+            mask_s1 = (self.df['disposal_level'] == lvl) & (self.df[t_col] == 's-1')
+            df_s1 = self.df.loc[mask_s1, ['Stock_id', 'event_start_date', 'Close']].rename(columns={'Close': 'Close_s1'})
             
-            if subset.empty: continue
+            if df_s3.empty or df_s1.empty: continue
 
-            # 計算這段期間的累積報酬 (複利計算：(1+r1)*(1+r2)... - 1)
-            grouped = subset.groupby(['Stock_id', 'event_start_date'])['daily_ret'].apply(
-                lambda x: (1 + x).prod() - 1
-            ).reset_index().rename(columns={'daily_ret': 'cum_ret'})
+            # 合併計算區間報酬: (s-1 Close / s-3 Open) - 1
+            merged = pd.merge(df_s3, df_s1, on=['Stock_id', 'event_start_date'], how='inner')
+            merged['cum_ret'] = (merged['Close_s1'] / merged['Open_s3']) - 1
             
-            grouped['direction'] = grouped['cum_ret'].apply(
+            merged['direction'] = merged['cum_ret'].apply(
                 lambda x: 'Overbought' if x > 0 else 'Oversold'
             )
-            event_trends.append(grouped[['Stock_id', 'event_start_date', 'direction']])
+            event_trends.append(merged[['Stock_id', 'event_start_date', 'direction']])
             
         if not event_trends:
             print("找不到 s-3 ~ s-1 的時間標籤資料")
