@@ -40,6 +40,7 @@ class DisposalAnalyzer:
             ly='mean',       # 上圖：平均超額報酬
             bar_col='count', # 下圖：樣本數
             ly_type='bar',   # 上圖強制畫長條
+            mid_col='std',   # 中圖：標準差 (變更參數名稱)
             note=note,
             bar_kwargs={'width': 0.8}
         )
@@ -373,7 +374,7 @@ class DisposalAnalyzer:
             print(f"缺少 {target_col}，無法繪圖")
             return
 
-        trend_stats = df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'count']).reset_index()
+        trend_stats = df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
         
         # 分別繪圖
         for direction in ['Overbought', 'Oversold']:
@@ -382,11 +383,15 @@ class DisposalAnalyzer:
             if stats.empty:
                 print(f"No data for {direction}")
                 continue
+            
+            # 排序方便閱讀
+            stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
+            stats = stats.sort_values('sort_key').drop(columns=['sort_key'])
                 
             # 繪圖
             self._plot_stats(
                 stats, 
-                target_col=target_col, 
+                target_col=target_col,
                 note=f'{direction} - Daily Return - {session}'
             )
 
