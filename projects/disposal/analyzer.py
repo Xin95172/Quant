@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from module.plot_func import plot
 from typing import Optional, List
 from IPython.display import display
@@ -216,9 +217,7 @@ class DisposalAnalyzer:
             merged = pd.merge(df_s3, df_s1, on=['Stock_id', 'event_start_date'], how='inner')
             merged['cum_ret'] = (merged['Close_s1'] / merged['Open_s3']) - 1
             
-            merged['direction'] = merged['cum_ret'].apply(
-                lambda x: 'Overbought' if x > 0 else 'Oversold'
-            )
+            merged['direction'] = np.where(merged['cum_ret'] > 0, 'Overbought', 'Oversold')
             event_trends.append(merged[['Stock_id', 'event_start_date', 'direction']])
             
         if not event_trends:
@@ -284,13 +283,23 @@ class DisposalAnalyzer:
         df_process['group_id'] = df_process['new_group'].cumsum()
         
         # 取得每個 Group 的 Start (Min Level) 與 End (Max Level) 日期
-        def get_dates(x):
-            start_date = x.loc[x['disposal_level'].idxmin(), 'event_start_date']
-            end_date = x.loc[x['disposal_level'].idxmax(), 'event_end_date']
-            return pd.Series({'base_start_date': start_date, 'base_end_date': end_date})
-
-        group_dates = df_process.groupby('group_id').apply(get_dates, include_groups=False)
-        df_process = df_process.merge(group_dates, on='group_id', how='left')
+        # 向量化取得每個 Group 的 Start (Min Level) 與 End (Max Level) 日期
+        g = df_process.groupby('group_id')['disposal_level']
+        # 使用 idxmin/idxmax 取得索引，直接定位資料
+        idx_min = g.idxmin()
+        idx_max = g.idxmax()
+        
+        # 提取日期資料
+        base_starts = df_process.loc[idx_min, ['group_id', 'event_start_date']].rename(
+            columns={'event_start_date': 'base_start_date'}
+        )
+        base_ends = df_process.loc[idx_max, ['group_id', 'event_end_date']].rename(
+            columns={'event_end_date': 'base_end_date'}
+        )
+        
+        # Merge 回主表
+        df_process = df_process.merge(base_starts, on='group_id', how='left')
+        df_process = df_process.merge(base_ends, on='group_id', how='left')
                 
         # 1. 計算該 Group 內的 Row Index (第幾筆交易)
         df_process['group_row_idx'] = df_process.groupby('group_id').cumcount()
@@ -302,7 +311,6 @@ class DisposalAnalyzer:
         # 找出 Start Index
         start_indices = df_process[df_process['Date'] == df_process['base_start_date']][['group_id', 'group_row_idx']]
         start_indices = start_indices.rename(columns={'group_row_idx': 'base_start_idx'})
-        # 避免重複 (理論上同 Group 同 Date 已經由 drop_duplicates 濾除，但保險起見)
         start_indices = start_indices.drop_duplicates(subset=['group_id'])
         
         # 找出 End Index
@@ -314,22 +322,23 @@ class DisposalAnalyzer:
         df_process = df_process.merge(start_indices, on='group_id', how='left')
         df_process = df_process.merge(end_indices, on='group_id', how='left')
         
-        # 3. 計算 Diff 並產生 Label
-        def format_t_label_trading_days(row):
-            # 'e' 系列 (>= End Index)
-            if pd.notna(row['base_end_idx']):
-                if row['group_row_idx'] >= row['base_end_idx']:
-                    diff = int(row['group_row_idx'] - row['base_end_idx'])
-                    return f"e+{diff}"
+        # 3. 向量化計算 Diff 並產生 Label
+        df_process['t_label'] = None
+        
+        # 條件：e 系列 (>= End Index)
+        mask_e = (df_process['base_end_idx'].notna()) & (df_process['group_row_idx'] >= df_process['base_end_idx'])
+        if mask_e.any():
+            diff_e = (df_process.loc[mask_e, 'group_row_idx'] - df_process.loc[mask_e, 'base_end_idx']).astype(int)
+            df_process.loc[mask_e, 't_label'] = 'e+' + diff_e.astype(str)
             
-            # 計算 's' 系列
-            if pd.notna(row['base_start_idx']):
-                diff = int(row['group_row_idx'] - row['base_start_idx'])
-                return f"s{'+' if diff >= 0 else ''}{diff}"
-                
-            return None
-
-        df_process['t_label'] = df_process.apply(format_t_label_trading_days, axis=1)
+        # 條件：s 系列 (Not e AND base_start_idx exists)
+        mask_s = (df_process['base_start_idx'].notna()) & (~mask_e)
+        if mask_s.any():
+            diff_s = (df_process.loc[mask_s, 'group_row_idx'] - df_process.loc[mask_s, 'base_start_idx']).astype(int)
+            # 處理正負號 - 使用 values 運算以避免 Index 對齊問題
+            vals_s = diff_s.values
+            signs = np.where(vals_s >= 0, '+', '')
+            df_process.loc[mask_s, 't_label'] = 's' + signs + vals_s.astype(str)
         
         final_df = df_process.drop(columns=[
             'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
