@@ -5,6 +5,7 @@ import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
+from sqlalchemy import text
 
 def process_disposal_events(disposal_info):
     """
@@ -607,3 +608,194 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     
     print(f"Analysis completed. Wide shape: {final_df.shape}, Long shape: {long_df.shape}")
     return final_df, long_df
+
+def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX'):
+    """
+    從 PostgreSQL 抓取大盤 (TAIEX) 與產業指數並合併至 price_df。
+    取代原本使用 FinMind API 的版本。
+    """
+    
+    
+    industry_map = {
+        '水泥工業': 'Cement',
+        '食品工業': 'Food',
+        '塑膠工業': 'Plastics',
+        '紡織纖維': 'Textiles',
+        '電機機械': 'ElectricMachinery',
+        '電器電纜': 'ElectricalCable',
+        '化學工業': 'Chemical',
+        '生技醫療業': 'BiotechnologyMedicalCare',
+        '生技醫療': 'BiotechnologyMedicalCare',
+        '玻璃陶瓷': 'GlassCeramic',
+        '造紙工業': 'PaperPulp',
+        '鋼鐵工業': 'IronSteel',
+        '橡膠工業': 'Rubber',
+        '汽車工業': 'Automobile',
+        '半導體業': 'Semiconductor',
+        '半導體': 'Semiconductor',
+        '電腦及週邊': 'ComputerPeripheralEquipment',
+        '電腦及週邊設備業': 'ComputerPeripheralEquipment',
+        '光電業': 'Optoelectronic',
+        '光電': 'Optoelectronic',
+        '通信網路業': 'CommunicationsInternet',
+        '通信網路': 'CommunicationsInternet',
+        '電子零組件': 'ElectronicPartsComponents',
+        '電子零組件業': 'ElectronicPartsComponents',
+        '電子通路業': 'ElectronicProductsDistribution',
+        '電子通路': 'ElectronicProductsDistribution',
+        '資訊服務業': 'InformationService',
+        '資訊服務': 'InformationService',
+        '其他電子業': 'OtherElectronic',
+        '其他電子': 'OtherElectronic',
+        '其他電子類': 'OtherElectronic',
+        '建材營造': 'BuildingMaterialConstruction',
+        '建材營造業': 'BuildingMaterialConstruction',
+        '航運業': 'ShippingTransportation',
+        '航運': 'ShippingTransportation',
+        '觀光餐旅': 'Tourism', 
+        '觀光事業': 'Tourism',
+        '觀光': 'Tourism',
+        '金融保險': 'FinancialInsurance',
+        '金融保險業': 'FinancialInsurance',
+        '貿易百貨': 'TradingConsumersGoods',
+        '貿易百貨業': 'TradingConsumersGoods',
+        '油電燃氣': 'OilGasElectricity',
+        '油電燃氣業': 'OilGasElectricity',
+        '其他': 'Other',
+        '電子工業': 'Electronic',
+        '化學生技醫療': 'ChemicalBiotechnologyMedicalCare',
+        '文創': 'CulturalCreative',
+        '文化創意業': 'CulturalCreative',
+        '農業科技': 'AgriculturalTechnology',
+        '農業科技業': 'AgriculturalTechnology',
+        '電子商務': 'ECommerce',
+        '電子商務業': 'ECommerce',
+        '運動休閒': 'SportLeisure',
+        '運動休閒類': 'SportLeisure',
+        '居家生活': 'HomeLife',
+        '居家生活類': 'HomeLife',
+        '綠能環保': 'GreenEnergyEnvironmental',
+        '綠能環保類': 'GreenEnergyEnvironmental',
+        '數位雲端': 'DigitalCloud',
+        '數位雲端類': 'DigitalCloud',
+        # Ignore these
+        'ETF': None,
+        '上櫃指數股票型基金(ETF)': None,
+        '創新版股票': None,
+        '創新板股票': None,
+        '存託憑證': None,
+    }
+
+    # [Critical Fix] Ensure price_df['Date'] is datetime object for merging
+    if 'Date' in price_df.columns:
+        price_df = price_df.copy() # Avoid SettingWithCopy
+        price_df['Date'] = pd.to_datetime(price_df['Date'])
+
+    print("Step 1: Fetching TAIEX data from Postgres...")
+    # 假設指數資料在 taiwan_stock_daily 表中，且 Stock_id 為 'TAIEX'
+    # 注意: 如果 table 名稱不同，請自行調整 FROM 子句
+    query_taiex = f"""
+        SELECT "Date", "Open", "High", "Low", "Close"
+        FROM public.taiwan_stock_daily
+        WHERE "Stock_id" = '{taiex_id}'
+        AND "Date" >= '2018-01-01'
+        ORDER BY "Date"
+    """
+    
+    try:
+        with pg_client._get_engine().connect() as conn:
+            taiex = pd.read_sql(text(query_taiex), conn)
+            
+        if not taiex.empty:
+            taiex = taiex.rename(columns={
+                'Open': 'TAIEX_Open', 'High': 'TAIEX_High', 
+                'Low': 'TAIEX_Low', 'Close': 'TAIEX_Close'
+            })
+            taiex['Date'] = pd.to_datetime(taiex['Date'])
+            
+            # 串接大盤
+            merged_df = price_df.merge(taiex, on='Date', how='left')
+            print(f"Merged TAIEX data: {len(taiex)} rows.")
+        else:
+             print("[Warning] TAIEX data not found in Postgres.")
+             merged_df = price_df
+             
+    except Exception as e:
+        print(f"[Error] Failed to fetch TAIEX: {e}")
+        merged_df = price_df
+
+    print("Step 2: Merging Industry Indexes from Postgres...")
+    
+    if 'industry' not in merged_df.columns:
+        print("[Warning] No 'industry' column found in price_df. Skipping industry index merge.")
+        return merged_df
+
+    # Map industries
+    merged_df['Related_Index_ID'] = merged_df['industry'].map(industry_map)
+    
+    # 檢查是否有未對應到的產業 (Exclude explicitly ignored ones which are None)
+    # We only care about unmapped values that are NOT in the map at all, or mapped to NaN but we expect them to be something?
+    # Actually map() returns NaN if key not found OR if value is None.
+    # So we check if the original industry was intended to be ignored.
+    
+    # Identify keys that are NOT in industry_map
+    # unique_industries = merged_df['industry'].unique()
+    # missing_keys = [ind for ind in unique_industries if ind not in industry_map]
+    
+    # But for now, let's just log what we got
+    # Filter out valid IDs (strings)
+    
+    # If the user wants to see what failed to map:
+    # We only warn if the industry is NOT in our ignore list (mapped to None)
+    # But map returns NaN for both "Missing Key" and "Value is None".
+    # So we explicitly check logic:
+    
+    unknown_mask = merged_df['Related_Index_ID'].isna()
+    if unknown_mask.any():
+        # Get industries that resulted in NaN
+        failed_inds = merged_df.loc[unknown_mask, 'industry'].unique()
+        # Filter out those that we INTENTIONALLY mapped to None (e.g. ETF)
+        really_unknown = [ind for ind in failed_inds if ind not in industry_map]
+        
+        if really_unknown:
+             print(f"[Warning] Some industries could not be mapped: {really_unknown}")
+        
+    required_indices = merged_df['Related_Index_ID'].dropna().unique().tolist()
+    print(f"Required Industry Indices: {required_indices}")
+    
+    if required_indices:
+        indices_list_str = "', '".join(str(s) for s in required_indices)
+        query_indices = f"""
+            SELECT "Date", "Stock_id" as "Related_Index_ID", "Open", "High", "Low", "Close"
+            FROM public.taiwan_stock_daily
+            WHERE "Stock_id" IN ('{indices_list_str}')
+            AND "Date" >= '2018-01-01'
+            ORDER BY "Stock_id", "Date"
+        """
+        
+        try:
+             with pg_client._get_engine().connect() as conn:
+                big_index_df = pd.read_sql(text(query_indices), conn)
+                
+             if not big_index_df.empty:
+                big_index_df = big_index_df.rename(columns={
+                    'Open': 'Ind_Open', 'High': 'Ind_High', 
+                    'Low': 'Ind_Low', 'Close': 'Ind_Close'
+                })
+                big_index_df['Date'] = pd.to_datetime(big_index_df['Date'])
+                
+                merged_df = merged_df.merge(
+                    big_index_df, 
+                    on=['Date', 'Related_Index_ID'], 
+                    how='left'
+                )
+                print("Done! Added columns: TAIEX_*, Ind_*")
+             else:
+                print("[Warning] No industry index data found in Postgres.")
+
+        except Exception as e:
+            print(f"[Error] Failed to fetch industry indices: {e}")
+    else:
+        print("No industry indices to fetch based on current mapping.")
+
+    return merged_df
