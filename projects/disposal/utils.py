@@ -691,9 +691,7 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
         price_df = price_df.copy() # Avoid SettingWithCopy
         price_df['Date'] = pd.to_datetime(price_df['Date'])
 
-    print("Step 1: Fetching TAIEX data from Postgres...")
     # 假設指數資料在 taiwan_stock_daily 表中，且 Stock_id 為 'TAIEX'
-    # 注意: 如果 table 名稱不同，請自行調整 FROM 子句
     query_taiex = f"""
         SELECT "Date", "Open", "High", "Low", "Close"
         FROM public.taiwan_stock_daily
@@ -715,7 +713,6 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
             
             # 串接大盤
             merged_df = price_df.merge(taiex, on='Date', how='left')
-            print(f"Merged TAIEX data: {len(taiex)} rows.")
         else:
              print("[Warning] TAIEX data not found in Postgres.")
              merged_df = price_df
@@ -724,7 +721,6 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
         print(f"[Error] Failed to fetch TAIEX: {e}")
         merged_df = price_df
 
-    print("Step 2: Merging Industry Indexes from Postgres...")
     
     if 'industry' not in merged_df.columns:
         print("[Warning] No 'industry' column found in price_df. Skipping industry index merge.")
@@ -732,23 +728,6 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
 
     # Map industries
     merged_df['Related_Index_ID'] = merged_df['industry'].map(industry_map)
-    
-    # 檢查是否有未對應到的產業 (Exclude explicitly ignored ones which are None)
-    # We only care about unmapped values that are NOT in the map at all, or mapped to NaN but we expect them to be something?
-    # Actually map() returns NaN if key not found OR if value is None.
-    # So we check if the original industry was intended to be ignored.
-    
-    # Identify keys that are NOT in industry_map
-    # unique_industries = merged_df['industry'].unique()
-    # missing_keys = [ind for ind in unique_industries if ind not in industry_map]
-    
-    # But for now, let's just log what we got
-    # Filter out valid IDs (strings)
-    
-    # If the user wants to see what failed to map:
-    # We only warn if the industry is NOT in our ignore list (mapped to None)
-    # But map returns NaN for both "Missing Key" and "Value is None".
-    # So we explicitly check logic:
     
     unknown_mask = merged_df['Related_Index_ID'].isna()
     if unknown_mask.any():
@@ -789,7 +768,6 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
                     on=['Date', 'Related_Index_ID'], 
                     how='left'
                 )
-                print("Done! Added columns: TAIEX_*, Ind_*")
              else:
                 print("[Warning] No industry index data found in Postgres.")
 
