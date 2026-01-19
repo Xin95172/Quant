@@ -58,7 +58,8 @@ class DisposalAnalyzer:
             mid_col='std',   # 中圖：標準差 (變更參數名稱)
             note=note,
             bar_kwargs={'width': 0.8},
-            return_marks=return_marks
+            return_marks=return_marks,
+            v_lines=['s+0', 'e+0']
         )
 
     def _display_dataframe(self, col: str, title: str):
