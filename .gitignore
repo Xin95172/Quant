@@ -1,3 +1,4 @@
+**/__pycache__/
 data/crypto_database
 account.json
-**/__pycache__/
+data/disposal/price_df.csv
