@@ -437,6 +437,9 @@ def run_event_study(price_df, disposal_info, offset_days=3):
             # No price data for this stock
             group['trading_idx_start'] = np.nan
             group['trading_idx_end'] = np.nan
+            # Ensure Stock_id is present (might be dropped by include_groups=False)
+            if 'Stock_id' not in group.columns:
+                group['Stock_id'] = stock
             return group
             
         p_dates, p_idxs = price_dates_map[stock]
@@ -482,12 +485,17 @@ def run_event_study(price_df, disposal_info, offset_days=3):
         group['trading_idx_start'] = val_starts
         group['trading_idx_end'] = val_ends
         
+        # Ensure Stock_id is present in output (since include_groups=False drops it)
+        if 'Stock_id' not in group.columns:
+            group['Stock_id'] = stock
+        
         return group
 
     # Apply mapping
     # Note: group_keys=False prevents index expansion
     if not events.empty:
-        events = events.groupby('Stock_id', group_keys=False).apply(get_event_indices)
+        # [Fix] Add include_groups=False to silence FutureWarning
+        events = events.groupby('Stock_id', group_keys=False).apply(get_event_indices, include_groups=False)
     else:
         events['trading_idx_start'] = np.nan
         events['trading_idx_end'] = np.nan
@@ -711,6 +719,24 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
             })
             taiex['Date'] = pd.to_datetime(taiex['Date'])
             
+            # Drop existing TAIEX columns to avoid merge conflict/duplicates
+            # [Fix] Robust cleanup: remove _x, _y variants as well
+            base_cols = [c for c in taiex.columns if c != 'Date']
+            cols_to_drop = []
+            for col in price_df.columns:
+                if col in base_cols:
+                    cols_to_drop.append(col)
+                elif col.endswith('_x') or col.endswith('_y'):
+                    base = col[:-2]
+                    if base in base_cols:
+                        cols_to_drop.append(col)
+            
+            if cols_to_drop:
+                # Deduplicate list
+                cols_to_drop = list(set(cols_to_drop))
+                # print(f"Dropping existing TAIEX columns to prevent duplication: {cols_to_drop}")
+                price_df = price_df.drop(columns=cols_to_drop)
+
             # 串接大盤
             merged_df = price_df.merge(taiex, on='Date', how='left')
         else:
@@ -763,6 +789,22 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
                 })
                 big_index_df['Date'] = pd.to_datetime(big_index_df['Date'])
                 
+                # [Fix] Drop existing Ind columns of same name before merge to avoid collisions and _x/_y
+                ind_base_cols = [c for c in big_index_df.columns if c not in ['Date', 'Related_Index_ID']]
+                ind_cols_to_drop = []
+                
+                for col in merged_df.columns:
+                    if col in ind_base_cols:
+                        ind_cols_to_drop.append(col)
+                    elif col.endswith('_x') or col.endswith('_y'):
+                        base = col[:-2]
+                        if base in ind_base_cols:
+                            ind_cols_to_drop.append(col)
+
+                if ind_cols_to_drop:
+                    ind_cols_to_drop = list(set(ind_cols_to_drop))
+                    merged_df = merged_df.drop(columns=ind_cols_to_drop)
+
                 merged_df = merged_df.merge(
                     big_index_df, 
                     on=['Date', 'Related_Index_ID'], 
@@ -777,3 +819,54 @@ def fetch_and_merge_indexes_from_postgres(price_df, pg_client, taiex_id='TAIEX')
         print("No industry indices to fetch based on current mapping.")
 
     return merged_df
+
+
+def fetch_prices_from_postgres(pg_client, disposal_events, offset_days=20):
+    """
+    從 PostgreSQL 批次取得股價 (取代 FinMind API)。
+    速度比 API 快，且直接包含 industry_category。
+    """
+    stock_ids = disposal_events['Stock_id'].unique().tolist()
+    
+    if not stock_ids:
+        print("[Warning] No stock IDs provided.")
+        return pd.DataFrame()
+        
+    # 格式化列表為 SQL 字串: '2330', '2317', '2603' ...
+    stock_list_str = "', '".join(str(s) for s in stock_ids)
+    
+    if 'event_start_date' in disposal_events.columns:
+        min_date = pd.to_datetime(disposal_events['event_start_date']).min() - pd.Timedelta(days=offset_days + 40)
+    else:
+        min_date = pd.Timestamp('2018-01-01')
+        
+    min_date_str = min_date.strftime('%Y-%m-%d')
+    
+    query = f"""
+    SELECT 
+        "Date",
+        "Stock_id",
+        "Open", "High", "Low", "Close", "Volume",
+        industry
+    FROM public.taiwan_stock_daily
+    WHERE "Stock_id" IN ('{stock_list_str}')
+      AND "Date" >= '{min_date_str}'
+    ORDER BY "Stock_id", "Date"
+    """
+    
+    try:
+        with pg_client._get_engine().connect() as conn:
+            price_df = pd.read_sql(text(query), conn)
+            
+        if not price_df.empty:
+            price_df['Date'] = pd.to_datetime(price_df['Date'])
+            price_df['trading_idx'] = price_df.groupby('Stock_id').cumcount()
+            
+        else:
+            print("[Warning] Query returned empty result.")
+            
+        return price_df
+        
+    except Exception as e:
+        print(f"[Error] Postgres query failed: {e}")
+        return pd.DataFrame()
