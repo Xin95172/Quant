@@ -496,6 +496,7 @@ class DisposalAnalyzer:
         """
         # 1. 準備數據
         df = self._compute_returns(df, session)
+        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
         
         # 計算產業報酬 (若無現成欄位則嘗試計算)
         if session == 'position':
