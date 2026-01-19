@@ -43,7 +43,7 @@ class DisposalAnalyzer:
             return 999.0
         return 999.0
 
-    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str):
+    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str, return_marks: str | None = None):
         """呼叫繪圖模組"""
         # 排序
         stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
@@ -57,7 +57,8 @@ class DisposalAnalyzer:
             ly_type='bar',   # 上圖強制畫長條
             mid_col='std',   # 中圖：標準差 (變更參數名稱)
             note=note,
-            bar_kwargs={'width': 0.8}
+            bar_kwargs={'width': 0.8},
+            return_marks=return_marks
         )
 
     def _display_dataframe(self, col: str, title: str):
