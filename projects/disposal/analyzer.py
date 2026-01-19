@@ -495,10 +495,19 @@ class DisposalAnalyzer:
             x_ticktext: X軸刻度標籤 (s+N / e+N)
         """
         # 1. 準備數據
-        df = self._compute_returns(df, session)
-        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
+        # 確保數據按時間排序，否則 shift 計算會錯誤
+        if 'Date' in df.columns:
+            df = df.sort_values(['Stock_id', 'Date'])
         
-        # 計算產業報酬 (若無現成欄位則嘗試計算)
+        df = self._compute_returns(df, session)
+        
+        # 動態建立分組欄位，避免 KeyError
+        group_cols = ['Stock_id']
+        for col in ['base_start_date', 'base_end_date']:
+            if col in df.columns:
+                group_cols.append(col)
+        
+        # 計算產業報酬
         if session == 'position':
             df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
             df['ind_ret'] = (df['Ind_Open'] / df['prev_ind_close']) - 1
@@ -574,25 +583,53 @@ class DisposalAnalyzer:
             print(f"X軸標籤映射失敗: {e}")
             return None, None, None
 
-    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20):
+    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20, split_by_direction: bool = True, use_browser: bool = True, show_metrics: list = None):
         """
         繪製 3D 表面圖 (Mean, Std, Count)
-        X軸: 第幾天 (Relative Day)
-        Y軸: 產業指數報酬 (Industry Return) - 分組後
-        Z軸: 個股報酬統計 (Mean, Std, Count)
-        """        
+        :param split_by_direction: 若 True 且 df 中包含 'direction' 欄位，則自動分開繪圖
+        :param use_browser: 若 True，使用外部瀏覽器開啟圖表 (避免 IDE WebGL 崩潰)
+        :param show_metrics: 指定要顯示的指標列表，預設為 ['mean']。可選值: 'mean', 'std', 'count'
+        """
+        # 預設僅顯示平均值，避免一次彈出太多視窗
+        if show_metrics is None:
+            show_metrics = ['mean']
+        elif isinstance(show_metrics, str):
+            show_metrics = [show_metrics]
+
+        # 自動分組邏輯
+        if split_by_direction and 'direction' in df.columns:
+            directions = df['direction'].unique()
+            if len(directions) > 1:
+                print(f"\\n[Auto Split] 檢測到多種 Direction: {directions}，將分開繪圖...")
+                for d in directions:
+                    sub_df = df[df['direction'] == d].copy()
+                    print(f"\\n>>> Plotting for Direction: {d}")
+                    # 遞迴呼叫，傳遞所有參數
+                    self.plot_3d_return_surface(sub_df, session, bins, split_by_direction=False, use_browser=use_browser, show_metrics=show_metrics)
+                return
+
         print(f"\\n[3D Surface Analysis] Session: {session}")
         
+        # 嘗試取得目前的 direction 名稱以標註在標題
+        current_direction = ""
+        if 'direction' in df.columns and len(df['direction'].unique()) == 1:
+            current_direction = f"[{df['direction'].iloc[0]}] "
+
         grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
         
         if grid_df is None:
             return
 
-        metrics = ['mean', 'std', 'count']
-        titles = ['Mean Return', 'Standard Deviation', 'Sample Count']
-        colorscales = ['Viridis', 'Plasma', 'Blues']
+        metrics_map = {'mean': 'Mean Return', 'std': 'Standard Deviation', 'count': 'Sample Count'}
+        colorscales = {'mean': 'Viridis', 'std': 'Plasma', 'count': 'Blues'}
 
-        for i, metric in enumerate(metrics):
+        for metric in show_metrics:
+            if metric not in metrics_map:
+                print(f"Unknown metric: {metric}, skipping.")
+                continue
+                
+            title = metrics_map[metric]
+            
             # Pivot using the Ordinal Index instead of numerical relative_day
             pivot_matrix = grid_df.pivot(index='ind_ret_mid', columns='relative_day_idx', values=metric)
             # Interpolate for smoother surface
@@ -602,27 +639,20 @@ class DisposalAnalyzer:
             y_data = pivot_matrix.index.values
             z_data = pivot_matrix.values
             
-            # If x_data is missing some indices (due to filtering/pivot), align ticks?
-            # pivot columns should match the indices present.
-            # However, surface plot x_data usually defines the coordinates.
-            # If pivot is sparse, we might miss some columns? 
-            # But grid_df is aggregated, so pivot columns are exactly what's in grid_df.
-            # We just need to ensure x_tickvals aligns with x_data if x_data is not complete 0..N
-            # But since we mapped from unique_days, x_data will be a subset of 0..N.
-            
             fig = go.Figure(data=[go.Surface(
                 z=z_data, 
                 x=x_data, 
                 y=y_data,
-                colorscale=colorscales[i],
-                colorbar=dict(title=titles[i])
+                colorscale=colorscales.get(metric, 'Viridis'),
+                colorbar=dict(title=title),
+                connectgaps=True 
             )])
 
 
             scene_dict=dict(
-                xaxis_title='Relative Day',
+                xaxis_title='t_label',
                 yaxis_title='Industry Return',
-                zaxis_title=titles[i],
+                zaxis_title=title,
                 aspectratio=dict(x=1, y=1, z=0.6) 
             )
 
@@ -635,20 +665,58 @@ class DisposalAnalyzer:
                 )
 
             fig.update_layout(
-                title=f'3D Surface (Plateau): {titles[i]} ({session})',
+                title=f'{current_direction}3D Surface (Plateau): {title} ({session})',
                 scene=scene_dict,
                 width=1000,
                 height=800,
+                annotations=[
+                    dict(
+                        text="X: t_label<br>Y: Industry Return<br>Z: " + title,
+                        x=0, y=1, 
+                        xref="paper", yref="paper",
+                        showarrow=False,
+                        align="left",
+                        bgcolor="white",
+                        opacity=0.8,
+                        bordercolor="black",
+                        borderwidth=1
+                    )
+                ]
             )
-            fig.show()
+            
+            if use_browser:
+                try:
+                    fig.show(renderer='browser')
+                except:
+                    print("無法呼叫瀏覽器，改用預設顯示。")
+                    fig.show()
+            else:
+                fig.show()
 
-    def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target, session: str = 'position', bins: int = 20):
+    def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target, session: str = 'position', bins: int = 20, split_by_direction: bool = True):
         """
         繪製 2D 切片圖
         :param slice_by: 'ind_ret' (固定產業報酬，看時間走勢) 或 'time' (固定時間，看產業報酬影響)
         :param target: 切片目標值。若 slice_by='ind_ret' 則為 float (e.g. 0.05); 若 slice_by='time' 則為 str (e.g. 's+5') 或數值
+        :param split_by_direction: 若 True 且 df 中包含 'direction' 欄位，則自動分開繪圖
         """
-        print(f"\\n[2D Slice Analysis] Session: {session}, Slice By: {slice_by}, Target: {target}")
+        # 自動分組邏輯
+        if split_by_direction and 'direction' in df.columns:
+            directions = df['direction'].unique()
+            if len(directions) > 1:
+                print(f"\n[Auto Split] 檢測到多種 Direction: {directions}，將分開繪圖...")
+                for d in directions:
+                    sub_df = df[df['direction'] == d].copy()
+                    print(f"\n>>> Plotting for Direction: {d}")
+                    self.plot_2d_slice(sub_df, slice_by, target, session, bins, split_by_direction=False)
+                return
+
+        print(f"\n[2D Slice Analysis] Session: {session}, Slice By: {slice_by}, Target: {target}")
+        
+        # 嘗試取得目前的 direction 名稱
+        current_direction = ""
+        if 'direction' in df.columns and len(df['direction'].unique()) == 1:
+            current_direction = f"[{df['direction'].iloc[0]}] "
         
         grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
         
@@ -687,7 +755,7 @@ class DisposalAnalyzer:
             ))
             
             fig.update_layout(
-                title=f'Daily Return Slice @ Industry Return ~ {closest_bin_val:.2%} ({session})',
+                title=f'{current_direction}Daily Return Slice @ Industry Return ~ {closest_bin_val:.2%} ({session})',
                 xaxis=dict(
                     tickvals=x_tickvals,
                     ticktext=x_ticktext,
@@ -736,7 +804,7 @@ class DisposalAnalyzer:
             ))
             
             fig.update_layout(
-                title=f'Daily Return Slice @ Time {day_str} ({session})',
+                title=f'{current_direction}Daily Return Slice @ Time {day_str} ({session})',
                 xaxis=dict(
                     title='Industry Return',
                     tickformat='.1%' 
