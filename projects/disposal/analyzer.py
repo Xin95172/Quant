@@ -47,7 +47,12 @@ class DisposalAnalyzer:
     def _compute_returns(self, df: pd.DataFrame, session: str) -> pd.DataFrame:
         """根據 session 計算個股與大盤報酬"""
         df = df.copy()
-        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
+        
+        # 動態建立分組欄位，避免 KeyError
+        group_cols = ['Stock_id']
+        for col in ['base_start_date', 'base_end_date']:
+            if col in df.columns:
+                group_cols.append(col)
         
         # 1. Stock Return
         if session == 'position':
