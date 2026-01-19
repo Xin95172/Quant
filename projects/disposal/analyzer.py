@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 from module.plot_func import plot
 from typing import Optional, List
 from IPython.display import display
@@ -43,7 +44,38 @@ class DisposalAnalyzer:
             return 999.0
         return 999.0
 
-    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str, return_marks: str | None = None):
+    def _compute_returns(self, df: pd.DataFrame, session: str) -> pd.DataFrame:
+        """根據 session 計算個股與大盤報酬"""
+        df = df.copy()
+        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
+        
+        # 1. Stock Return
+        if session == 'position':
+            df['daily_ret'] = (df['Close'] / df['Open']) - 1
+            if 'TAIEX_Close' in df.columns:
+                df['market_ret'] = (df['TAIEX_Close'] / df['TAIEX_Open']) - 1
+        elif session == 'after_market':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Open'] / df['prev_close']) - 1
+            if 'TAIEX_Close' in df.columns:
+                df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
+                df['market_ret'] = (df['TAIEX_Open'] / df['market_prev_close']) - 1
+        elif session == 'all':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Close'] / df['prev_close']) - 1
+            if 'TAIEX_Close' in df.columns:
+                 df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
+                 df['market_ret'] = (df['TAIEX_Close'] / df['market_prev_close']) - 1
+
+        # 2. Abnormal Return
+        if 'market_ret' in df.columns:
+            df['abnormal_ret'] = df['daily_ret'] - df['market_ret']
+        else:
+            df['abnormal_ret'] = np.nan
+            
+        return df
+
+    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str, return_marks: str | None = None, v_lines: list | None = None):
         """呼叫繪圖模組"""
         # 排序
         stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
@@ -388,18 +420,14 @@ class DisposalAnalyzer:
         if 'event_start_date' not in df.columns:
             print("少了 base_end_date")
         
-        if session == 'position':
-            # 日盤：開盤 -> 收盤 (當日)
-            df['daily_ret'] = (df['Close'] / df['Open']) - 1
-        elif session == 'after_market':
-            # 夜盤：前收 -> 今開 (需分組 shift)
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['daily_ret'] = (df['Open'] / df['prev_close']) - 1
-        elif session == 'all':
-            # 全日：前收 -> 今收 (需分組 shift)
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['daily_ret'] = (df['Close'] / df['prev_close']) - 1
-            
+        if 'base_start_date' not in df.columns:
+            print("少了 base_start_date")
+        if 'event_start_date' not in df.columns:
+            print("少了 base_end_date")
+        
+        # 計算報酬
+        df = self._compute_returns(df, session)
+        
         # 移除暫存欄位
         if 'prev_close' in df.columns:
             df.drop(columns=['prev_close'], inplace=True)
@@ -456,6 +484,162 @@ class DisposalAnalyzer:
                     target_col=target_col,
                     note=f'{direction} ({config_name}) - Daily Return - {session}'
                 )
+
+
+
+
+    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20):
+        """
+        繪製 3D 表面圖 (Mean, Std, Count)
+        X軸: 第幾天 (Relative Day)
+        Y軸: 產業指數報酬 (Industry Return) - 分組後
+        Z軸: 個股報酬統計 (Mean, Std, Count)
+        """
+        print(f"\\n[3D Surface Analysis] Session: {session}")
+        
+        # 1. 準備數據
+        df = self._compute_returns(df, session)
+        
+        # 計算產業報酬 (若無現成欄位則嘗試計算)
+        if 'ind_ret' not in df.columns:
+            if 'Ind_Close' in df.columns and 'Ind_Open' in df.columns:
+                 if session == 'position':
+                     df['ind_ret'] = (df['Ind_Close'] / df['Ind_Open']) - 1
+                 else:
+                     df['ind_ret'] = (df['Ind_Close'] / df['Ind_Open']) - 1
+            else:
+                print("缺少產業指數價格 (Ind_Open/Ind_Close)，無法計算產業報酬。")
+                return
+
+        # 準備 X 軸: Relative Day
+        # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
+        # 因為 CSV 中的 relative_day 可能只是連續天數，沒有區分 e 系列
+        if 't_label' not in df.columns:
+             # 嘗試尋找替代欄位
+             target_col = next((c for c in ['t_label_first', 't_label_second', 't_label_third', 't_label_fourth'] if c in df.columns), None)
+             if target_col:
+                 df['t_label'] = df[target_col]
+        
+        if 't_label' in df.columns:
+             # 強制重算，以確保 e 系列的 1000+ 特性被保留
+             df['relative_day'] = df['t_label'].apply(self._parse_t_val)
+        elif 'relative_day' not in df.columns:
+             print("缺少 relative_day 或 t_label，無法定位時間軸。")
+             return
+        
+        # 移除無法解析的天數
+        # 999.0 為 _parse_t_val 解析失敗的代碼，需排除
+        df = df[(df['relative_day'] < 2000) & (df['relative_day'] != 999.0)]
+
+        # 2. 準備 Y 軸: Industry Return Binning
+        q_low = df['ind_ret'].quantile(0.01)
+        q_high = df['ind_ret'].quantile(0.99)
+        df_filtered = df[(df['ind_ret'] >= q_low) & (df['ind_ret'] <= q_high)].copy()
+        
+        try:
+             df_filtered['ind_ret_bin'] = pd.cut(df_filtered['ind_ret'], bins=bins)
+             df_filtered['ind_ret_mid'] = df_filtered['ind_ret_bin'].apply(lambda x: x.mid).astype(float)
+        except Exception as e:
+            print(f"分組失敗: {e}")
+            return
+
+        # 3. 計算統計量 (Aggregation)
+        grid_df = df_filtered.groupby(['relative_day', 'ind_ret_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
+        
+        if grid_df.empty:
+            print("無數據可繪圖")
+            return
+
+        # 5. 繪製三張圖 (Mean, Std, Count) - 3D Surface (Plateau)
+        # Prepare X-axis labels with dual format (s+Xe+Y) if possible
+        x_tickvals = None
+        x_ticktext = None
+
+        try:
+             # Ensure t_label exists for mapping or synthesize it
+             # We rely on relative_day value to reconstruct the label:
+             # < 1000 -> s+val
+             # >= 1000 -> e+(val-1000)
+             
+             # Get unique relative days sorted
+             unique_days = np.sort(df_filtered['relative_day'].unique())
+             
+             # Create a mapping from relative_day to Ordinal Index (0, 1, 2...)
+             # This eliminates the numerical gap between s (~0) and e (~1000)
+             day_map = {val: i for i, val in enumerate(unique_days)}
+             
+             # Apply mapping to grid_df
+             grid_df['relative_day_idx'] = grid_df['relative_day'].map(day_map)
+             
+             # Generate Ticks
+             def format_label(val):
+                 val = int(val)
+                 if val >= 1000:
+                     return f"e{val - 1000:+d}"
+                 else:
+                     return f"s{val:+d}"
+             
+             x_tickvals = np.arange(len(unique_days))
+             x_ticktext = [format_label(val) for val in unique_days]
+
+        except Exception as e:
+            print(f"X軸標籤映射失敗: {e}")
+            x_tickvals = None
+            x_ticktext = None
+
+        metrics = ['mean', 'std', 'count']
+        titles = ['Mean Return', 'Standard Deviation', 'Sample Count']
+        colorscales = ['Viridis', 'Plasma', 'Blues']
+
+        for i, metric in enumerate(metrics):
+            # Pivot using the Ordinal Index instead of numerical relative_day
+            pivot_matrix = grid_df.pivot(index='ind_ret_mid', columns='relative_day_idx', values=metric)
+            # Interpolate for smoother surface
+            pivot_matrix = pivot_matrix.interpolate(axis=0).interpolate(axis=1)
+            
+            x_data = pivot_matrix.columns.values
+            y_data = pivot_matrix.index.values
+            z_data = pivot_matrix.values
+            
+            # If x_data is missing some indices (due to filtering/pivot), align ticks?
+            # pivot columns should match the indices present.
+            # However, surface plot x_data usually defines the coordinates.
+            # If pivot is sparse, we might miss some columns? 
+            # But grid_df is aggregated, so pivot columns are exactly what's in grid_df.
+            # We just need to ensure x_tickvals aligns with x_data if x_data is not complete 0..N
+            # But since we mapped from unique_days, x_data will be a subset of 0..N.
+            
+            fig = go.Figure(data=[go.Surface(
+                z=z_data, 
+                x=x_data, 
+                y=y_data,
+                colorscale=colorscales[i],
+                colorbar=dict(title=titles[i])
+            )])
+
+
+            scene_dict=dict(
+                xaxis_title='Relative Day',
+                yaxis_title='Industry Return',
+                zaxis_title=titles[i],
+                aspectratio=dict(x=1, y=1, z=0.6) 
+            )
+
+            # Apply custom axis labels if available
+            if x_tickvals is not None:
+                scene_dict['xaxis'] = dict(
+                    tickvals=x_tickvals,
+                    ticktext=x_ticktext,
+                    title='Relative Day'
+                )
+
+            fig.update_layout(
+                title=f'3D Surface (Plateau): {titles[i]} ({session})',
+                scene=scene_dict,
+                width=1000,
+                height=800,
+            )
+            fig.show()
 
 
 # Backward compatibility
