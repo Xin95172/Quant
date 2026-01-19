@@ -523,44 +523,41 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     event_study_df['calendar_relative_day'] = (event_study_df['Date'] - event_study_df['event_start_date']).dt.days
 
     # 6. 產生 t_label (s+N / e+N format)
-    def generate_label(row):
-        # 優先判斷是否已經過了解除日 (e+N)
-        # 邏輯：如果你在 End Date 之後 (trading_idx > trading_idx_end)，則算 e+
-        # 或者 Date >= Event End Date
-        
-        # 使用 trading_idx 判斷最準
-        # 如果當天 index >= end index，則屬於 e+系列
-        # 但要注意：e+0 定義為「不處置的第一天」還是「處置最後一天」？
-        # 通常處置期間是 [Start, End]。
-        # 用戶指示：End Date should be e+0? 
-        # 之前的邏輯：`if row['Date'] >= row['event_end_date']` return e+
-        # 如果 End Date 是週五，週五當天符合 >= End Date。所以週五是 e+0?
-        # 如果週五是最後一天處置日，通常 e+0 是指「恢復正常的第一天」or 「最後一天」?
-        # 依照慣例，s+0 是開始第一天。
-        # 如果 End Date 是處置最後一天。那 End Date 當天應該還是處置中 (s+N)。
-        # 而 e+1 才是恢復正常。
-        # 但這取決於使用者習慣。
-        # (原代碼邏輯)：`if date >= end_date: e+...`
-        # 這樣 End Date 當天會變成 e+0 (因為 diff=0)。
-        # 我們維持原邏輯。
-        
-        idx_current = row['trading_idx']
-        idx_end = row['trading_idx_end']
-        
-        if idx_current >= idx_end:
-            # e+N
-            val = int(idx_current - idx_end)
-            return f'e+{val}'
-            
-        # s+N / s-N
-        val_s = int(row['relative_day'])
-        if val_s >= 0:
-            return f's+{val_s}'
-        else:
-            return f's{val_s}' # s-3
-
-    t_label_series = event_study_df.apply(generate_label, axis=1)
+    # [Optimize] Vectorized implementation to replace row-wise apply
     
+    # Calculate components
+    idx_current = event_study_df['trading_idx'].values
+    idx_end = event_study_df['trading_idx_end'].values
+    val_s = event_study_df['relative_day'].values
+    
+    # Conditions
+    # e+N: trading_idx >= trading_idx_end
+    mask_e = idx_current >= idx_end
+    
+    # Pre-allocate array
+    labels = np.empty(len(event_study_df), dtype=object)
+    
+    # 1. Fill e+ labels
+    if mask_e.any():
+        val_e = (idx_current[mask_e] - idx_end[mask_e]).astype(int)
+        labels[mask_e] = 'e+' + val_e.astype(str)
+        
+    # 2. Fill s labels (where not e)
+    mask_s = ~mask_e
+    if mask_s.any():
+        s_vals = val_s[mask_s].astype(int)
+        # s+N where s >= 0
+        mask_s_pos = mask_s & (val_s >= 0)
+        if mask_s_pos.any():
+            labels[mask_s_pos] = 's+' + val_s[mask_s_pos].astype(int).astype(str)
+            
+        # s-N where s < 0
+        mask_s_neg = mask_s & (val_s < 0)
+        if mask_s_neg.any():
+            labels[mask_s_neg] = 's' + val_s[mask_s_neg].astype(int).astype(str)
+            
+    t_label_series = pd.Series(labels, index=event_study_df.index)
+
     # Split into columns dynamically based on level
     level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
     unique_levels = sorted(event_study_df['disposal_level'].unique())
@@ -569,9 +566,9 @@ def run_event_study(price_df, disposal_info, offset_days=3):
     for lvl in unique_levels:
         suffix = level_map.get(lvl, f"level_{lvl}")
         col_name = f't_label_{suffix}'
-        event_study_df[col_name] = event_study_df.apply(
-            lambda row: t_label_series[row.name] if row['disposal_level'] == lvl else None, axis=1
-        )
+        # [Optimize] Vectorized assignment
+        mask_lvl = event_study_df['disposal_level'] == lvl
+        event_study_df[col_name] = np.where(mask_lvl, t_label_series, None)
     
     # [Added] Capture Long Format Dataframe before pivoting
     long_df = event_study_df.copy()

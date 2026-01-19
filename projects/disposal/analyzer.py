@@ -16,18 +16,32 @@ class DisposalAnalyzer:
         display(self.df)
 
     @staticmethod
-    def _parse_t_val(t_str: str) -> int:
-        """解析時間標籤 (e.g., 's+1', 'e-5') 為數值以利排序"""
-        if not isinstance(t_str, str): return 999
-        prefix = t_str[0]
+    @staticmethod
+    def _parse_t_val(t_str: str) -> float:
+        """解析時間標籤 (e.g., 's+1', 'e-5') 為數值以利排序 - [Optimized]"""
+        if not isinstance(t_str, str) or not t_str: return 999.0
+        
+        # Fast parsing assuming standard format s/e +/- N
         try:
-            val = int(t_str.split('+')[-1]) if '+' in t_str else int(t_str.split('s')[-1]) 
-            if 's-' in t_str: val = -int(t_str.split('-')[-1])
-            if prefix == 's': return val
-            elif prefix == 'e': return 1000 + val
+            prefix = t_str[0] # 's' or 'e'
+            # Check for sign
+            if '+' in t_str:
+                val = int(t_str.split('+')[1])
+            elif '-' in t_str or ('s' in t_str and len(t_str) > 1 and t_str[1] == '-'):
+                # s-3 or s3 (if s-3 is stored as s-3)
+                # Assuming 's-3' format or 's3' (negative not explicitly allowed in split old logic?)
+                # Old logic: if 's-' in t_str: val = -int(t_str.split('-')[-1])
+                parts = t_str.split('-')
+                val = -int(parts[1]) if len(parts) > 1 else 0
+            else:
+                # s3 (s+3) format or just number? Assuming sN is positive if no sign
+                val = int(t_str[1:])
+                
+            if prefix == 's': return float(val)
+            elif prefix == 'e': return 1000.0 + val
         except:
-            return 999
-        return 999
+            return 999.0
+        return 999.0
 
     def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str):
         """呼叫繪圖模組"""
@@ -284,67 +298,80 @@ class DisposalAnalyzer:
         
         # 取得每個 Group 的 Start (Min Level) 與 End (Max Level) 日期
         # 向量化取得每個 Group 的 Start (Min Level) 與 End (Max Level) 日期
+        
+        # 1. 計算該 Group 內的 Row Index (第幾筆交易) - Vectorized
+        df_process['group_row_idx'] = df_process.groupby('group_id').cumcount()
+        
+        # 2. 取得每個 Group 的 Start (Min Level) 與 End (Max Level) 的基準資訊
+        # [Optimize] Use direct indexing instead of expensive merge
         g = df_process.groupby('group_id')['disposal_level']
-        # 使用 idxmin/idxmax 取得索引，直接定位資料
+        
+        # idxmin/idxmax returns the index of the first occurrence of min/max
         idx_min = g.idxmin()
         idx_max = g.idxmax()
         
-        # 提取日期資料
-        base_starts = df_process.loc[idx_min, ['group_id', 'event_start_date']].rename(
-            columns={'event_start_date': 'base_start_date'}
-        )
-        base_ends = df_process.loc[idx_max, ['group_id', 'event_end_date']].rename(
-            columns={'event_end_date': 'base_end_date'}
-        )
+        # 取得 Start 基準：Min Level 發生的那一天的 trading_idx (作為基準 0)
+        # Note: trading_idx is global. group_row_idx is local (0..N).
+        # We define t_label based on offset from Event Start/End.
+        # Event Start is at the Min Level row.
+        # Event End is at the Max Level row.
         
-        # Merge 回主表
-        df_process = df_process.merge(base_starts, on='group_id', how='left')
-        df_process = df_process.merge(base_ends, on='group_id', how='left')
-                
-        # 1. 計算該 Group 內的 Row Index (第幾筆交易)
-        df_process['group_row_idx'] = df_process.groupby('group_id').cumcount()
+        # Extract trading_idx and trading_idx_end using direct mapping
+        # map: group_id -> trading_idx (of start event)
+        start_t_idx_map = df_process.loc[idx_min, ['group_id', 'trading_idx']].set_index('group_id')['trading_idx']
+        # End event reference: we need the trading_idx_end of the LAST event (Max Level)
+        end_t_idx_map = df_process.loc[idx_max, ['group_id', 'trading_idx_end']].set_index('group_id')['trading_idx_end']
         
-        # 2. 找出 Base Start Date 與 Base End Date 在該 Group 對應的 Index
-        df_process['base_start_date'] = pd.to_datetime(df_process['base_start_date'])
-        df_process['base_end_date'] = pd.to_datetime(df_process['base_end_date'])
+        # Map back to main DF - vectorized O(N)
+        df_process['base_start_t_idx'] = df_process['group_id'].map(start_t_idx_map)
+        df_process['base_end_t_idx'] = df_process['group_id'].map(end_t_idx_map)
         
-        # 找出 Start Index
-        start_indices = df_process[df_process['Date'] == df_process['base_start_date']][['group_id', 'group_row_idx']]
-        start_indices = start_indices.rename(columns={'group_row_idx': 'base_start_idx'})
-        start_indices = start_indices.drop_duplicates(subset=['group_id'])
-        
-        # 找出 End Index
-        end_indices = df_process[df_process['Date'] == df_process['base_end_date']][['group_id', 'group_row_idx']]
-        end_indices = end_indices.rename(columns={'group_row_idx': 'base_end_idx'})
-        end_indices = end_indices.drop_duplicates(subset=['group_id'])
-        
-        # Merge 指標回主表
-        df_process = df_process.merge(start_indices, on='group_id', how='left')
-        df_process = df_process.merge(end_indices, on='group_id', how='left')
-        
-        # 3. 向量化計算 Diff 並產生 Label
+        # 3. Vectorized Label Generation
         df_process['t_label'] = None
         
-        # 條件：e 系列 (>= End Index)
-        mask_e = (df_process['base_end_idx'].notna()) & (df_process['group_row_idx'] >= df_process['base_end_idx'])
+        curr_t_idx = df_process['trading_idx'].values
+        base_start = df_process['base_start_t_idx'].values
+        base_end = df_process['base_end_t_idx'].values
+        
+        # e+N: Current >= End Index
+        mask_e = (curr_t_idx >= base_end)
+        
+        # Allocate result array
+        labels = np.full(len(df_process), None, dtype=object)
+        
         if mask_e.any():
-            diff_e = (df_process.loc[mask_e, 'group_row_idx'] - df_process.loc[mask_e, 'base_end_idx']).astype(int)
-            df_process.loc[mask_e, 't_label'] = 'e+' + diff_e.astype(str)
+            diff_e = (curr_t_idx[mask_e] - base_end[mask_e]).astype(int)
+            labels[mask_e] = 'e+' + diff_e.astype(str)
             
-        # 條件：s 系列 (Not e AND base_start_idx exists)
-        mask_s = (df_process['base_start_idx'].notna()) & (~mask_e)
+        # s+N / s-N: Not e
+        mask_s = (~mask_e) & (~np.isnan(base_start))
         if mask_s.any():
-            diff_s = (df_process.loc[mask_s, 'group_row_idx'] - df_process.loc[mask_s, 'base_start_idx']).astype(int)
-            # 處理正負號 - 使用 values 運算以避免 Index 對齊問題
-            vals_s = diff_s.values
-            signs = np.where(vals_s >= 0, '+', '')
-            df_process.loc[mask_s, 't_label'] = 's' + signs + vals_s.astype(str)
+            diff_s = (curr_t_idx[mask_s] - base_start[mask_s]).astype(int)
+            # vectorized string formatting
+            s_vals = diff_s
+            pos_mask = s_vals >= 0
+            neg_mask = s_vals < 0
+            
+            # Fill logic
+            # Sub-masking relative to original array involves boolean indexing carefully
+            # Let's perform assignment on the subset directly? No, hard with mixed masks.
+            # Use temporary arrays for the subset
+            
+            subset_labels = np.empty(len(diff_s), dtype=object)
+            
+            if pos_mask.any():
+                subset_labels[pos_mask] = 's+' + s_vals[pos_mask].astype(str)
+            if neg_mask.any():
+                subset_labels[neg_mask] = 's' + s_vals[neg_mask].astype(str)
+                
+            labels[mask_s] = subset_labels
+
+        df_process['t_label'] = labels
         
         final_df = df_process.drop(columns=[
             'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
-            'group_row_idx', 'base_start_idx', 'base_end_idx'
+            'group_row_idx', 'base_start_t_idx', 'base_end_t_idx'
         ])
-        final_df.to_csv('test.csv')
         
         return final_df
 
@@ -385,24 +412,48 @@ class DisposalAnalyzer:
 
         trend_stats = df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
         
-        # 分別繪圖
-        for direction in ['Overbought', 'Oversold']:
-            # 篩選該方向數據
-            stats = trend_stats[trend_stats['direction'] == direction].copy()
-            if stats.empty:
-                print(f"No data for {direction}")
+        # 定義要繪製的子集配置: (標籤, 篩選函數)
+        plot_configs = [('All', lambda d: pd.Series(True, index=d.index))]
+        
+        if 'interval' in df.columns:
+            plot_configs.append(('5min', lambda d: d['interval'].astype(str).str.contains('5')))
+            plot_configs.append(('20min', lambda d: d['interval'].astype(str).str.contains('20')))
+
+        # 針對每個配置繪圖
+        for config_name, filter_func in plot_configs:
+            # 根據配置篩選資料
+            try:
+                mask = filter_func(df)
+                sub_df = df[mask].copy()
+            except Exception as e:
+                print(f"Error filtering for {config_name}: {e}")
                 continue
-            
-            # 排序方便閱讀
-            stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
-            stats = stats.sort_values('sort_key').drop(columns=['sort_key'])
                 
-            # 繪圖
-            self._plot_stats(
-                stats, 
-                target_col=target_col,
-                note=f'{direction} - Daily Return - {session}'
-            )
+            if sub_df.empty:
+                print(f"No data for {config_name} interval.")
+                continue
+
+            # 重新計算該子集的統計數據
+            sub_stats = sub_df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
+
+            # 分別繪圖 (Overbought / Oversold)
+            for direction in ['Overbought', 'Oversold']:
+                # 篩選該方向數據
+                stats = sub_stats[sub_stats['direction'] == direction].copy()
+                if stats.empty:
+                    print(f"No data for {direction} ({config_name})")
+                    continue
+                
+                # 排序方便閱讀
+                stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
+                stats = stats.sort_values('sort_key').drop(columns=['sort_key'])
+                    
+                # 繪圖
+                self._plot_stats(
+                    stats, 
+                    target_col=target_col,
+                    note=f'{direction} ({config_name}) - Daily Return - {session}'
+                )
 
 
 # Backward compatibility
