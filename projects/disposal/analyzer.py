@@ -499,12 +499,12 @@ class DisposalAnalyzer:
         
         # 計算產業報酬 (若無現成欄位則嘗試計算)
         if session == 'position':
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['ind_ret'] = (df['Open'] / df['prev_close']) - 1
+            df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['ind_ret'] = (df['Ind_Open'] / df['prev_ind_close']) - 1
         elif session == 'after_market':
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['prev_open'] = df.groupby(group_cols)['Open'].shift(1)
-            df['ind_ret'] = (df['prev_close'] / df['prev_open']) - 1
+            df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['prev_ind_open'] = df.groupby(group_cols)['Ind_Open'].shift(1)
+            df['ind_ret'] = (df['prev_ind_close'] / df['prev_ind_open']) - 1
 
         # 準備 X 軸: Relative Day
         # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構

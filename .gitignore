@@ -2,3 +2,4 @@
 data/crypto_database
 account.json
 data/disposal/price_df.csv
+**/test.csv
