@@ -488,15 +488,14 @@ class DisposalAnalyzer:
 
 
 
-    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20):
+    def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int):
         """
-        繪製 3D 表面圖 (Mean, Std, Count)
-        X軸: 第幾天 (Relative Day)
-        Y軸: 產業指數報酬 (Industry Return) - 分組後
-        Z軸: 個股報酬統計 (Mean, Std, Count)
+        準備 3D/2D 繪圖所需的聚合數據
+        回傳:
+            grid_df: 聚合後的 DataFrame, 包含 relative_day_idx, ind_ret_mid, mean, std, count
+            x_tickvals: X軸刻度值 (連續索引)
+            x_ticktext: X軸刻度標籤 (s+N / e+N)
         """
-        print(f"\\n[3D Surface Analysis] Session: {session}")
-        
         # 1. 準備數據
         df = self._compute_returns(df, session)
         
@@ -509,7 +508,7 @@ class DisposalAnalyzer:
                      df['ind_ret'] = (df['Ind_Close'] / df['Ind_Open']) - 1
             else:
                 print("缺少產業指數價格 (Ind_Open/Ind_Close)，無法計算產業報酬。")
-                return
+                return None, None, None
 
         # 準備 X 軸: Relative Day
         # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
@@ -525,7 +524,7 @@ class DisposalAnalyzer:
              df['relative_day'] = df['t_label'].apply(self._parse_t_val)
         elif 'relative_day' not in df.columns:
              print("缺少 relative_day 或 t_label，無法定位時間軸。")
-             return
+             return None, None, None
         
         # 移除無法解析的天數
         # 999.0 為 _parse_t_val 解析失敗的代碼，需排除
@@ -541,31 +540,21 @@ class DisposalAnalyzer:
              df_filtered['ind_ret_mid'] = df_filtered['ind_ret_bin'].apply(lambda x: x.mid).astype(float)
         except Exception as e:
             print(f"分組失敗: {e}")
-            return
+            return None, None, None
 
         # 3. 計算統計量 (Aggregation)
         grid_df = df_filtered.groupby(['relative_day', 'ind_ret_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
         
         if grid_df.empty:
             print("無數據可繪圖")
-            return
+            return None, None, None
 
-        # 5. 繪製三張圖 (Mean, Std, Count) - 3D Surface (Plateau)
-        # Prepare X-axis labels with dual format (s+Xe+Y) if possible
-        x_tickvals = None
-        x_ticktext = None
-
+        # 4. X軸標籤映射 (連續索引)
         try:
-             # Ensure t_label exists for mapping or synthesize it
-             # We rely on relative_day value to reconstruct the label:
-             # < 1000 -> s+val
-             # >= 1000 -> e+(val-1000)
-             
              # Get unique relative days sorted
              unique_days = np.sort(df_filtered['relative_day'].unique())
              
              # Create a mapping from relative_day to Ordinal Index (0, 1, 2...)
-             # This eliminates the numerical gap between s (~0) and e (~1000)
              day_map = {val: i for i, val in enumerate(unique_days)}
              
              # Apply mapping to grid_df
@@ -581,11 +570,28 @@ class DisposalAnalyzer:
              
              x_tickvals = np.arange(len(unique_days))
              x_ticktext = [format_label(val) for val in unique_days]
+             
+             return grid_df, x_tickvals, x_ticktext
 
         except Exception as e:
             print(f"X軸標籤映射失敗: {e}")
-            x_tickvals = None
-            x_ticktext = None
+            return None, None, None
+
+    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20):
+        """
+        繪製 3D 表面圖 (Mean, Std, Count)
+        X軸: 第幾天 (Relative Day)
+        Y軸: 產業指數報酬 (Industry Return) - 分組後
+        Z軸: 個股報酬統計 (Mean, Std, Count)
+        """
+        print(f"\\n[3D Surface Analysis] Session: {session}")
+        
+        print(f"\\n[3D Surface Analysis] Session: {session}")
+        
+        grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
+        
+        if grid_df is None:
+            return
 
         metrics = ['mean', 'std', 'count']
         titles = ['Mean Return', 'Standard Deviation', 'Sample Count']
@@ -640,6 +646,60 @@ class DisposalAnalyzer:
                 height=800,
             )
             fig.show()
+
+    def plot_slice_at_industry_return(self, df: pd.DataFrame, target_return: float, session: str = 'position', bins: int = 20):
+        """
+        繪製特定產業報酬 (Industry Return) 下，個股報酬的時間走勢 (2D 切片)
+        """
+        print(f"\\n[2D Slice Analysis] Session: {session}, Target Ind Ret: {target_return:.2%}")
+        
+        grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
+        
+        if grid_df is None:
+            return
+
+        # 找到最近的 Bin
+        unique_bins = np.sort(grid_df['ind_ret_mid'].unique())
+        closest_idx = np.abs(unique_bins - target_return).argmin()
+        closest_bin_val = unique_bins[closest_idx]
+        
+        print(f"Selected closest industry return bin: {closest_bin_val:.2%}")
+        
+        # 篩選該 Bin 的數據
+        slice_df = grid_df[grid_df['ind_ret_mid'] == closest_bin_val].sort_values('relative_day_idx')
+        
+        if slice_df.empty:
+            print("該區間無數據。")
+            return
+
+        # 繪圖
+        fig = go.Figure()
+        
+        # Mean Return Line
+        fig.add_trace(go.Scatter(
+            x=slice_df['relative_day_idx'],
+            y=slice_df['mean'],
+            mode='lines+markers',
+            name='Mean Return',
+            error_y=dict(
+                type='data',
+                array=slice_df['std'], # 顯示標準差作為 Error Bar
+                visible=True
+            )
+        ))
+        
+        fig.update_layout(
+            title=f'Daily Return Slice @ Industry Return ~ {closest_bin_val:.2%} ({session})',
+            xaxis=dict(
+                tickvals=x_tickvals,
+                ticktext=x_ticktext,
+                title='Relative Day'
+            ),
+            yaxis=dict(title='Daily Return'),
+            width=1000,
+            height=600
+        )
+        fig.show()
 
 
 # Backward compatibility
