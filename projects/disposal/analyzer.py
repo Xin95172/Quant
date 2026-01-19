@@ -486,8 +486,6 @@ class DisposalAnalyzer:
                 )
 
 
-
-
     def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int):
         """
         準備 3D/2D 繪圖所需的聚合數據
@@ -500,15 +498,13 @@ class DisposalAnalyzer:
         df = self._compute_returns(df, session)
         
         # 計算產業報酬 (若無現成欄位則嘗試計算)
-        if 'ind_ret' not in df.columns:
-            if 'Ind_Close' in df.columns and 'Ind_Open' in df.columns:
-                 if session == 'position':
-                     df['ind_ret'] = (df['Ind_Close'] / df['Ind_Open']) - 1
-                 else:
-                     df['ind_ret'] = (df['Ind_Close'] / df['Ind_Open']) - 1
-            else:
-                print("缺少產業指數價格 (Ind_Open/Ind_Close)，無法計算產業報酬。")
-                return None, None, None
+        if session == 'position':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['ind_ret'] = (df['Open'] / df['prev_close']) - 1
+        elif session == 'after_market':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['prev_open'] = df.groupby(group_cols)['Open'].shift(1)
+            df['ind_ret'] = (df['prev_close'] / df['prev_open']) - 1
 
         # 準備 X 軸: Relative Day
         # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
@@ -583,9 +579,7 @@ class DisposalAnalyzer:
         X軸: 第幾天 (Relative Day)
         Y軸: 產業指數報酬 (Industry Return) - 分組後
         Z軸: 個股報酬統計 (Mean, Std, Count)
-        """
-        print(f"\\n[3D Surface Analysis] Session: {session}")
-        
+        """        
         print(f"\\n[3D Surface Analysis] Session: {session}")
         
         grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
@@ -647,58 +641,113 @@ class DisposalAnalyzer:
             )
             fig.show()
 
-    def plot_slice_at_industry_return(self, df: pd.DataFrame, target_return: float, session: str = 'position', bins: int = 20):
+    def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target, session: str = 'position', bins: int = 20):
         """
-        繪製特定產業報酬 (Industry Return) 下，個股報酬的時間走勢 (2D 切片)
+        繪製 2D 切片圖
+        :param slice_by: 'ind_ret' (固定產業報酬，看時間走勢) 或 'time' (固定時間，看產業報酬影響)
+        :param target: 切片目標值。若 slice_by='ind_ret' 則為 float (e.g. 0.05); 若 slice_by='time' 則為 str (e.g. 's+5') 或數值
         """
-        print(f"\\n[2D Slice Analysis] Session: {session}, Target Ind Ret: {target_return:.2%}")
+        print(f"\\n[2D Slice Analysis] Session: {session}, Slice By: {slice_by}, Target: {target}")
         
         grid_df, x_tickvals, x_ticktext = self._prepare_surface_data(df, session, bins)
         
         if grid_df is None:
             return
 
-        # 找到最近的 Bin
-        unique_bins = np.sort(grid_df['ind_ret_mid'].unique())
-        closest_idx = np.abs(unique_bins - target_return).argmin()
-        closest_bin_val = unique_bins[closest_idx]
-        
-        print(f"Selected closest industry return bin: {closest_bin_val:.2%}")
-        
-        # 篩選該 Bin 的數據
-        slice_df = grid_df[grid_df['ind_ret_mid'] == closest_bin_val].sort_values('relative_day_idx')
-        
-        if slice_df.empty:
-            print("該區間無數據。")
-            return
-
-        # 繪圖
         fig = go.Figure()
         
-        # Mean Return Line
-        fig.add_trace(go.Scatter(
-            x=slice_df['relative_day_idx'],
-            y=slice_df['mean'],
-            mode='lines+markers',
-            name='Mean Return',
-            error_y=dict(
-                type='data',
-                array=slice_df['std'], # 顯示標準差作為 Error Bar
-                visible=True
+        if slice_by == 'ind_ret':
+            # Case A: 固定產業報酬，觀察時間走勢 (X=Time, Y=Return)
+            
+            # 確保 target 是 float
+            try:
+                target_val = float(target)
+            except:
+                print(f"Invalid target for ind_ret: {target}")
+                return
+
+            # 找到最近的 Bin
+            unique_bins = np.sort(grid_df['ind_ret_mid'].unique())
+            closest_idx = np.abs(unique_bins - target_val).argmin()
+            closest_bin_val = unique_bins[closest_idx]
+            
+            print(f"Selected closest industry return bin: {closest_bin_val:.2%}")
+            
+            # 篩選
+            slice_df = grid_df[grid_df['ind_ret_mid'] == closest_bin_val].sort_values('relative_day_idx')
+            
+            # 繪圖
+            fig.add_trace(go.Scatter(
+                x=slice_df['relative_day_idx'],
+                y=slice_df['mean'],
+                mode='lines+markers',
+                name=f'Ind Ret ~ {closest_bin_val:.2%}',
+                error_y=dict(type='data', array=slice_df['std'], visible=True)
+            ))
+            
+            fig.update_layout(
+                title=f'Daily Return Slice @ Industry Return ~ {closest_bin_val:.2%} ({session})',
+                xaxis=dict(
+                    tickvals=x_tickvals,
+                    ticktext=x_ticktext,
+                    title='Relative Day'
+                ),
+                yaxis=dict(title='Daily Return')
             )
-        ))
-        
-        fig.update_layout(
-            title=f'Daily Return Slice @ Industry Return ~ {closest_bin_val:.2%} ({session})',
-            xaxis=dict(
-                tickvals=x_tickvals,
-                ticktext=x_ticktext,
-                title='Relative Day'
-            ),
-            yaxis=dict(title='Daily Return'),
-            width=1000,
-            height=600
-        )
+
+        elif slice_by == 'time':
+            # Case B: 固定時間，觀察產業報酬影響 (X=Ind Ret, Y=Return)
+            
+            # 解析 target 時間
+            if isinstance(target, str):
+                target_val = self._parse_t_val(target)
+            else:
+                target_val = float(target)
+                
+            if target_val == 999.0:
+                 print(f"Invalid time target: {target}")
+                 return
+
+            # 找到最近的時間點
+            # 注意 grid_df['relative_day'] 是數值 (包含 1000+ 的 e 系列)
+            unique_days = np.sort(grid_df['relative_day'].unique())
+            closest_idx = np.abs(unique_days - target_val).argmin()
+            closest_day_val = unique_days[closest_idx]
+            
+            # 還原顯示標籤 (for title)
+            if closest_day_val >= 1000:
+                day_str = f"e{int(closest_day_val)-1000:+d}"
+            else:
+                day_str = f"s{int(closest_day_val):+d}"
+                
+            print(f"Selected closest relative day: {day_str} (val={closest_day_val})")
+            
+            # 篩選
+            slice_df = grid_df[grid_df['relative_day'] == closest_day_val].sort_values('ind_ret_mid')
+            
+            # 繪圖
+            fig.add_trace(go.Scatter(
+                x=slice_df['ind_ret_mid'],
+                y=slice_df['mean'],
+                mode='lines+markers',
+                name=f'Time @ {day_str}',
+                error_y=dict(type='data', array=slice_df['std'], visible=True)
+            ))
+            
+            fig.update_layout(
+                title=f'Daily Return Slice @ Time {day_str} ({session})',
+                xaxis=dict(
+                    title='Industry Return',
+                    tickformat='.1%' 
+                ),
+                yaxis=dict(title='Daily Return')
+            )
+            
+        else:
+            print(f"Unknown slice_by mode: {slice_by}")
+            return
+
+        fig.update_layout(width=1000, height=600)
         fig.show()
 
 
