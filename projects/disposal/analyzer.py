@@ -527,12 +527,12 @@ class DisposalAnalyzer:
         
         # 計算產業因子
         if session == 'position':
-            df['prev_open'] = df.groupby(group_cols)['Ind_open'].shift(4)
-            df['ind_factor'] = (df['Open']/df['prev_open']) - 1
+            df['close_-5'] = df.groupby(group_cols)['Ind_Close'].shift(5)
+            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['ind_factor'] = (df['close_-1']/df['close_-5']) - 1
         elif session == 'after_market':
-            df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
-            df['prev_ind_open'] = df.groupby(group_cols)['Ind_Open'].shift(1)
-            df['ind_factor'] = (df['prev_ind_close'] / df['prev_ind_open']) - 1
+            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['ind_factor'] = (df['Ind_Close'] / df['close_-1']) - 1
 
         # 準備 X 軸: Relative Day
         # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
@@ -619,6 +619,7 @@ class DisposalAnalyzer:
             directions = df['direction'].unique()
             if len(directions) > 1:
                 print(f"\n[Auto Split] 檢測到多種 Direction: {directions}，將分開繪圖...")
+                df = df.loc[df['direction'] != 'unknown']
                 for d in directions:
                     sub_df = df[df['direction'] == d].copy()
                     print(f"\n>>> Plotting for Direction: {d}")
@@ -626,7 +627,7 @@ class DisposalAnalyzer:
                     self.plot_3d_return_surface(sub_df, session, bins, split_by_direction=False, use_browser=use_browser, show_metrics=show_metrics)
                 return
 
-        print(f"\\n[3D Surface Analysis] Session: {session}")
+        print(f"\n[3D Surface Analysis] Session: {session}")
         
         # 嘗試取得目前的 direction 名稱以標註在標題
         current_direction = ""
