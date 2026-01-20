@@ -618,10 +618,10 @@ class DisposalAnalyzer:
         if split_by_direction and 'direction' in df.columns:
             directions = df['direction'].unique()
             if len(directions) > 1:
-                print(f"\\n[Auto Split] 檢測到多種 Direction: {directions}，將分開繪圖...")
+                print(f"\n[Auto Split] 檢測到多種 Direction: {directions}，將分開繪圖...")
                 for d in directions:
                     sub_df = df[df['direction'] == d].copy()
-                    print(f"\\n>>> Plotting for Direction: {d}")
+                    print(f"\n>>> Plotting for Direction: {d}")
                     # 遞迴呼叫，傳遞所有參數
                     self.plot_3d_return_surface(sub_df, session, bins, split_by_direction=False, use_browser=use_browser, show_metrics=show_metrics)
                 return
