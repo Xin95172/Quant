@@ -527,17 +527,8 @@ class DisposalAnalyzer:
         
         # 計算產業因子
         if session == 'position':
-            # df['prev_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
-            # df['ind_factor'] = np.where(
-            #     (df['Low']/df['prev_close']) - 1,
-            #     df['Low'] > df['prev_close'],
-            #     np.where(
-            #         (df['High']/df['prev_close']) - 1,
-            #         df['High'] <df['prev_close'],
-            #         0
-            #     )
-            # )
-            df['ind_factor'] = df.groupby(group_cols)['Ind_Open'].rolling(4).mean()
+            df['prev_open'] = df.groupby(group_cols)['Ind_open'].shift(4)
+            df['ind_factor'] = (df['Open']/df['prev_open']) - 1
         elif session == 'after_market':
             df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
             df['prev_ind_open'] = df.groupby(group_cols)['Ind_Open'].shift(1)
