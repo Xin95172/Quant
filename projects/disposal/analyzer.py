@@ -370,6 +370,13 @@ class DisposalAnalyzer:
         # Map back to main DF - vectorized O(N)
         df_process['base_start_t_idx'] = df_process['group_id'].map(start_t_idx_map)
         df_process['base_end_t_idx'] = df_process['group_id'].map(end_t_idx_map)
+
+        # Retrieve base_start_date and base_end_date
+        start_date_map = df_process.loc[idx_min, ['group_id', 'event_start_date']].set_index('group_id')['event_start_date']
+        end_date_map = df_process.loc[idx_max, ['group_id', 'event_end_date']].set_index('group_id')['event_end_date']
+        
+        df_process['base_start_date'] = df_process['group_id'].map(start_date_map)
+        df_process['base_end_date'] = df_process['group_id'].map(end_date_map)
         
         # 3. Vectorized Label Generation
         df_process['t_label'] = None
@@ -429,15 +436,9 @@ class DisposalAnalyzer:
         繪製不同趨勢下的每日平均報酬 (Daily Return)
         """
         # 決定分組欄位：優先使用合併後的 base_start_date，其次用 event_start_date
-        group_cols = ['Stock_id', 'base_start_date', 'base_end_date']
         if 'base_start_date' not in df.columns:
             print("少了 base_start_date")
-        if 'event_start_date' not in df.columns:
-            print("少了 base_end_date")
-        
-        if 'base_start_date' not in df.columns:
-            print("少了 base_start_date")
-        if 'event_start_date' not in df.columns:
+        if 'base_end_date' not in df.columns:
             print("少了 base_end_date")
         
         # 計算報酬
@@ -499,7 +500,7 @@ class DisposalAnalyzer:
                     target_col=target_col,
                     note=f'{direction} ({config_name}) - Daily Return - {session}'
                 )
-
+        
 
     def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int):
         """
