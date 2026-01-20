@@ -501,6 +501,8 @@ class DisposalAnalyzer:
                     note=f'{direction} ({config_name}) - Daily Return - {session}'
                 )
         
+                stats.to_csv(f'test_{direction}.csv', index=False)
+
 
     def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int):
         """
