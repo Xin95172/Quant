@@ -508,7 +508,7 @@ class DisposalAnalyzer:
         """
         準備 3D/2D 繪圖所需的聚合數據
         回傳:
-            grid_df: 聚合後的 DataFrame, 包含 relative_day_idx, ind_ret_mid, mean, std, count
+            grid_df: 聚合後的 DataFrame, 包含 relative_day_idx, ind_factor_mid, mean, std, count
             x_tickvals: X軸刻度值 (連續索引)
             x_ticktext: X軸刻度標籤 (s+N / e+N)
         """
@@ -525,14 +525,23 @@ class DisposalAnalyzer:
             if col in df.columns:
                 group_cols.append(col)
         
-        # 計算產業報酬
+        # 計算產業因子
         if session == 'position':
-            df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
-            df['ind_ret'] = (df['Ind_Open'] / df['prev_ind_close']) - 1
+            # df['prev_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            # df['ind_factor'] = np.where(
+            #     (df['Low']/df['prev_close']) - 1,
+            #     df['Low'] > df['prev_close'],
+            #     np.where(
+            #         (df['High']/df['prev_close']) - 1,
+            #         df['High'] <df['prev_close'],
+            #         0
+            #     )
+            # )
+            df['ind_factor'] = df.groupby(group_cols)['Ind_Open'].rolling(4).mean()
         elif session == 'after_market':
             df['prev_ind_close'] = df.groupby(group_cols)['Ind_Close'].shift(1)
             df['prev_ind_open'] = df.groupby(group_cols)['Ind_Open'].shift(1)
-            df['ind_ret'] = (df['prev_ind_close'] / df['prev_ind_open']) - 1
+            df['ind_factor'] = (df['prev_ind_close'] / df['prev_ind_open']) - 1
 
         # 準備 X 軸: Relative Day
         # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
@@ -555,19 +564,19 @@ class DisposalAnalyzer:
         df = df[(df['relative_day'] < 2000) & (df['relative_day'] != 999.0)]
 
         # 2. 準備 Y 軸: Industry Return Binning
-        q_low = df['ind_ret'].quantile(0.01)
-        q_high = df['ind_ret'].quantile(0.99)
-        df_filtered = df[(df['ind_ret'] >= q_low) & (df['ind_ret'] <= q_high)].copy()
+        q_low = df['ind_factor'].quantile(0.01)
+        q_high = df['ind_factor'].quantile(0.99)
+        df_filtered = df[(df['ind_factor'] >= q_low) & (df['ind_factor'] <= q_high)].copy()
         
         try:
-             df_filtered['ind_ret_bin'] = pd.cut(df_filtered['ind_ret'], bins=bins)
-             df_filtered['ind_ret_mid'] = df_filtered['ind_ret_bin'].apply(lambda x: x.mid).astype(float)
+             df_filtered['ind_factor_bin'] = pd.cut(df_filtered['ind_factor'], bins=bins)
+             df_filtered['ind_factor_mid'] = df_filtered['ind_factor_bin'].apply(lambda x: x.mid).astype(float)
         except Exception as e:
             print(f"分組失敗: {e}")
             return None, None, None
 
         # 3. 計算統計量 (Aggregation)
-        grid_df = df_filtered.groupby(['relative_day', 'ind_ret_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
+        grid_df = df_filtered.groupby(['relative_day', 'ind_factor_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
         
         if grid_df.empty:
             print("無數據可繪圖")
@@ -649,7 +658,7 @@ class DisposalAnalyzer:
             title = metrics_map[metric]
             
             # Pivot using the Ordinal Index instead of numerical relative_day
-            pivot_matrix = grid_df.pivot(index='ind_ret_mid', columns='relative_day_idx', values=metric)
+            pivot_matrix = grid_df.pivot(index='ind_factor_mid', columns='relative_day_idx', values=metric)
             # Interpolate for smoother surface
             pivot_matrix = pivot_matrix.interpolate(axis=0).interpolate(axis=1)
             
@@ -714,8 +723,8 @@ class DisposalAnalyzer:
     def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target, session: str = 'position', bins: int = 20, split_by_direction: bool = True):
         """
         繪製 2D 切片圖
-        :param slice_by: 'ind_ret' (固定產業報酬，看時間走勢) 或 'time' (固定時間，看產業報酬影響)
-        :param target: 切片目標值。若 slice_by='ind_ret' 則為 float (e.g. 0.05); 若 slice_by='time' 則為 str (e.g. 's+5') 或數值
+        :param slice_by: 'ind_factor' (固定產業報酬，看時間走勢) 或 'time' (固定時間，看產業報酬影響)
+        :param target: 切片目標值。若 slice_by='ind_factor' 則為 float (e.g. 0.05); 若 slice_by='time' 則為 str (e.g. 's+5') 或數值
         :param split_by_direction: 若 True 且 df 中包含 'direction' 欄位，則自動分開繪圖
         """
         # 自動分組邏輯
@@ -743,25 +752,25 @@ class DisposalAnalyzer:
 
         fig = go.Figure()
         
-        if slice_by == 'ind_ret':
+        if slice_by == 'ind_factor':
             # Case A: 固定產業報酬，觀察時間走勢 (X=Time, Y=Return)
             
             # 確保 target 是 float
             try:
                 target_val = float(target)
             except:
-                print(f"Invalid target for ind_ret: {target}")
+                print(f"Invalid target for ind_factor: {target}")
                 return
 
             # 找到最近的 Bin
-            unique_bins = np.sort(grid_df['ind_ret_mid'].unique())
+            unique_bins = np.sort(grid_df['ind_factor_mid'].unique())
             closest_idx = np.abs(unique_bins - target_val).argmin()
             closest_bin_val = unique_bins[closest_idx]
             
             print(f"Selected closest industry return bin: {closest_bin_val:.2%}")
             
             # 篩選
-            slice_df = grid_df[grid_df['ind_ret_mid'] == closest_bin_val].sort_values('relative_day_idx')
+            slice_df = grid_df[grid_df['ind_factor_mid'] == closest_bin_val].sort_values('relative_day_idx')
             
             # 繪圖
             fig.add_trace(go.Scatter(
@@ -810,11 +819,11 @@ class DisposalAnalyzer:
             print(f"Selected closest relative day: {day_str} (val={closest_day_val})")
             
             # 篩選
-            slice_df = grid_df[grid_df['relative_day'] == closest_day_val].sort_values('ind_ret_mid')
+            slice_df = grid_df[grid_df['relative_day'] == closest_day_val].sort_values('ind_factor_mid')
             
             # 繪圖
             fig.add_trace(go.Scatter(
-                x=slice_df['ind_ret_mid'],
+                x=slice_df['ind_factor_mid'],
                 y=slice_df['mean'],
                 mode='lines+markers',
                 name=f'Time @ {day_str}',
