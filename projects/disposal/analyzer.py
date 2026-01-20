@@ -301,7 +301,6 @@ class DisposalAnalyzer:
             )
             display(ct)
         
-
         
         # 重新定義 "t_label"
         # 邏輯：
@@ -324,13 +323,20 @@ class DisposalAnalyzer:
         # 生成分組 Group ID (同前次邏輯)
         df_process['prev_stock'] = df_process['Stock_id'].shift(1)
         df_process['prev_level'] = df_process['disposal_level'].shift(1)
-        df_process['prev_end'] = df_process['event_end_date'].shift(1)
-        
         cond_stock_change = df_process['Stock_id'] != df_process['prev_stock']
         is_level_1 = df_process['disposal_level'] == 1
         prev_not_1 = df_process['prev_level'] != 1
-        end_date_diff = df_process['event_end_date'] != df_process['prev_end']
-        cond_new_event = is_level_1 & (prev_not_1 | end_date_diff)
+        
+        # Check for start date change to identify new event chains accurately
+        df_process['prev_start_date'] = df_process['event_start_date'].shift(1)
+        cond_start_date_change = df_process['event_start_date'] != df_process['prev_start_date']
+        
+        # New Group Logic:
+        # 1. Stock Change (Handled by cond_stock_change)
+        # 2. Level Reset: Level 1 AND Start Date Changed
+        #    - If Previous was Level 2, 3... -> Level 1 (New Chain or Start Date change) -> Reset
+        #    - If Previous was Level 1 -> Level 1 (Different Start Date) -> Reset
+        cond_new_event = is_level_1 & cond_start_date_change
         
         df_process['new_group'] = cond_stock_change | cond_new_event
         df_process['group_id'] = df_process['new_group'].cumsum()
@@ -356,8 +362,8 @@ class DisposalAnalyzer:
         # Event End is at the Max Level row.
         
         # Extract trading_idx and trading_idx_end using direct mapping
-        # map: group_id -> trading_idx (of start event)
-        start_t_idx_map = df_process.loc[idx_min, ['group_id', 'trading_idx']].set_index('group_id')['trading_idx']
+        # map: group_id -> trading_idx_start (of start event)
+        start_t_idx_map = df_process.loc[idx_min, ['group_id', 'trading_idx_start']].set_index('group_id')['trading_idx_start']
         # End event reference: we need the trading_idx_end of the LAST event (Max Level)
         end_t_idx_map = df_process.loc[idx_max, ['group_id', 'trading_idx_end']].set_index('group_id')['trading_idx_end']
         
@@ -407,11 +413,15 @@ class DisposalAnalyzer:
 
         df_process['t_label'] = labels
 
-        final_df = df_process.drop(columns=[
-            'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
-            'group_row_idx', 'base_start_t_idx', 'base_end_t_idx'
-        ])
-        
+        # Debug: Keep intermediate columns
+        # final_df = df_process.drop(columns=[
+        #     'prev_stock', 'prev_level', 'new_group', 'group_id',
+        #     'group_row_idx', 'base_start_t_idx', 'base_end_t_idx',
+        #     'prev_trading_idx', 'prev_start_date'
+        # ])
+        final_df = df_process
+
+        final_df.to_csv('test.csv', index=False)
         return final_df
 
     def plot_trend_return(self, df: pd.DataFrame, session: str = 'position'):
