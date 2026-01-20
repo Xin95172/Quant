@@ -286,7 +286,7 @@ class DisposalAnalyzer:
             
         self.df = self.df.merge(all_trends, on=['Stock_id', 'event_start_date'], how='left')
         self.df['direction'] = self.df['direction'].fillna('Unknown')
-        
+
         # 1. 顯示基本分佈
         self._display_dataframe('direction', '處置前趨勢分佈 (s-3 ~ s-1)')
 
@@ -406,7 +406,7 @@ class DisposalAnalyzer:
             labels[mask_s] = subset_labels
 
         df_process['t_label'] = labels
-        
+
         final_df = df_process.drop(columns=[
             'prev_stock', 'prev_level', 'prev_end', 'new_group', 'group_id',
             'group_row_idx', 'base_start_t_idx', 'base_end_t_idx'
