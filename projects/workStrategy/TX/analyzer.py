@@ -1,7 +1,7 @@
 import pandas as pd
 import module.plot_func as plot
 import plotly.graph_objects as go
-import IPython.display as display
+from IPython.display import display
 
 class TXAnalyzer:
     def __init__(self, df: pd.DataFrame):
@@ -19,6 +19,10 @@ class TXAnalyzer:
         self.df['cum_daily_ret_a'] = self.df['daily_ret_a'].cumsum()
     
     def display_df(self):
+        return self.df
+
+    def update_df(self, df):
+        self.df = df
         return self.df
 
     def daily_ret(self):
@@ -85,32 +89,69 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
         return plot.plot(temp_df, ly='cum_daily_ret_a', x='index', ry = 'daily_ret', sub_ly='daily_ret_a')
 
-    def indicator_vwap(self):
+    def indicator_gap_days(self,demean: bool = False, point_version: bool = False):
         temp_df = self.df.copy()
-        temp_df['CumPV'] = (temp_df['Close'] * temp_df['Volume']).rolling(1).sum()
-        temp_df['CumV'] = temp_df['Volume'].rolling(1).sum()
-        temp_df['vwap'] = temp_df['CumPV'] / temp_df['CumV']
-        
-        temp_df['vwap'] = temp_df['vwap'].shift(1)
-        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
-        temp_df = temp_df.sort_values(by='vwap').reset_index(drop=True)
-        temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
-
-        return plot.plot(temp_df, ly='cum_daily_ret_a', ry='vwap', sub_ly='daily_ret_a')
-
-    def indicator_gap_days(self):
-        temp_df = self.df.copy()
-        cols_a = temp_df.columns[temp_df.columns.str.endswith('_a')]
-        
-        temp_df[cols_a] = temp_df[cols_a].shift(-1)
-        
+        temp_df['daily_ret'] = temp_df['daily_ret'].shift(1)
+        temp_df.index = pd.to_datetime(temp_df.index)
         temp_df['prev_date'] = temp_df.index.to_series().shift(1)
         temp_df['gap'] = (temp_df.index.to_series() - temp_df['prev_date']).dt.days
-                
         temp_df = temp_df.sort_values(by='gap').reset_index(drop=True)
+        if point_version:
+            temp_df['daily_ret_a'] = (temp_df['Close_a'] - temp_df['Open_a'])
+            temp_df['daily_ret'] = (temp_df['Close'] - temp_df['Open'])
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+
+        return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='gap', sub_ly='daily_ret_a')
+
+    def indicator_maintenance_rate(self, point_version: bool = False):
+        if 'TotalExchangeMarginMaintenance' not in self.df.columns:
+            raise ValueError("TotalExchangeMarginMaintenance is not in the DataFrame.")
+        temp_df = self.df.copy()
+        temp_df['TotalExchangeMarginMaintenance'] = temp_df['TotalExchangeMarginMaintenance'].shift(1)
+        if point_version:
+            temp_df['daily_ret_a'] = (temp_df['Close_a'] - temp_df['Open_a'])
+            temp_df['daily_ret'] = (temp_df['Close'] - temp_df['Open'])
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+        temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        temp_df = temp_df.sort_values(by='TotalExchangeMarginMaintenance').reset_index(drop=True)
         temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
 
-        return plot.plot(temp_df, ly='cum_daily_ret_a', ry='gap', sub_ly='daily_ret_a')
+        return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly='daily_ret_a')
 
-    
+    def indicator_margin_delta(self, demean: bool = False):
+        temp_df = self.df.copy()
+        temp_df['margin_delta'] = (temp_df['MarginPurchaseMoney']/temp_df['MarginPurchaseMoney'].shift(1)) - 1
+        temp_df['avg_margin_delta'] = temp_df['margin_delta'].shift(1).rolling(window=20).mean()
+        temp_df = temp_df.sort_values(by='avg_margin_delta').reset_index(drop=True)
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='avg_margin_delta', sub_ly=['daily_ret_a'])
+
+    def indicator_institutional_flow(self, demean: bool = False):
+        temp_df = self.df.copy()
+        temp_df['foreign_inflow'] = (temp_df['Net_Foreign_Investor'] - temp_df['Net_Foreign_Investor'].rolling(window=20).mean()) / temp_df['Net_Foreign_Investor'].rolling(window=20).std()
+        temp_df['foreign_inflow'] = temp_df['foreign_inflow'].shift(1)
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
+        temp_df = temp_df.sort_values(by='foreign_inflow').reset_index(drop=True)
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='foreign_inflow', sub_ly='daily_ret_a')
