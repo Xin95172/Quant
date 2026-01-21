@@ -80,21 +80,10 @@ class TXAnalyzer:
     def indicator_position_ret(self):
         temp_df = self.df.copy()
         temp_df['daily_ret'] = temp_df['daily_ret'].shift(1)
+        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df = temp_df.sort_values(by='daily_ret').reset_index(drop=True)
-        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
         return plot.plot(temp_df, ly='cum_daily_ret_a', x='index', ry = 'daily_ret', sub_ly='daily_ret_a')
-
-    def indicator_1(self):
-        """
-        前一根 K 棒 + 當天日盤
-        """
-        temp_df = self.df.copy()
-        temp_df['daily_ret'] = temp_df['daily_ret'].shift(1)
-        temp_df['whole_daily_ret'] = (temp_df['Close_a'] / temp_df['Open']) - 1
-        temp_df['indicator_1'] = temp_df['daily_ret'] + temp_df['whole_daily_ret'].shift(1)
-        temp_df = temp_df.sort_values(by='indicator_1').reset_index(drop=True)
-        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
-        return plot.plot(temp_df, ly='cum_daily_ret_a', x='index', ry = 'indicator_1', sub_ly='daily_ret_a')
 
     def indicator_vwap(self):
         temp_df = self.df.copy()
@@ -103,8 +92,9 @@ class TXAnalyzer:
         temp_df['vwap'] = temp_df['CumPV'] / temp_df['CumV']
         
         temp_df['vwap'] = temp_df['vwap'].shift(1)
+        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df = temp_df.sort_values(by='vwap').reset_index(drop=True)
-        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
 
         return plot.plot(temp_df, ly='cum_daily_ret_a', ry='vwap', sub_ly='daily_ret_a')
 
@@ -118,7 +108,9 @@ class TXAnalyzer:
         temp_df['gap'] = (temp_df.index.to_series() - temp_df['prev_date']).dt.days
                 
         temp_df = temp_df.sort_values(by='gap').reset_index(drop=True)
-        
-        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+        temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
 
         return plot.plot(temp_df, ly='cum_daily_ret_a', ry='gap', sub_ly='daily_ret_a')
+
+    
