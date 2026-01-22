@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import module.plot_func as plot
 import plotly.graph_objects as go
 from IPython.display import display
@@ -113,7 +114,7 @@ class TXAnalyzer:
 
         return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='gap', sub_ly='daily_ret_a')
 
-    def indicator_maintenance_rate(self, point_version: bool = False):
+    def indicator_maintenance_rate(self, demean: bool = False, point_version: bool = False):
         if 'TotalExchangeMarginMaintenance' not in self.df.columns:
             raise ValueError("TotalExchangeMarginMaintenance is not in the DataFrame.")
         temp_df = self.df.copy()
@@ -121,11 +122,15 @@ class TXAnalyzer:
         if point_version:
             temp_df['daily_ret_a'] = (temp_df['Close_a'] - temp_df['Open_a'])
             temp_df['daily_ret'] = (temp_df['Close'] - temp_df['Open'])
-        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
-        temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
         temp_df = temp_df.sort_values(by='TotalExchangeMarginMaintenance').reset_index(drop=True)
-        temp_df['cum_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
-        temp_df['cum_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
 
         return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly='daily_ret_a')
 
@@ -180,3 +185,39 @@ class TXAnalyzer:
         display(self._get_statistics(ret_col=temp_df.loc[temp_df['divergence'] > 0, 'daily_ret_a']))
         display(self._get_statistics(ret_col=temp_df.loc[temp_df['divergence'] > 0, 'daily_ret']))
         return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='divergence', sub_ly='daily_ret_a', point_ry=0)
+
+    def indicator_US_bond(self, demean: bool = False, indicator: [str] = ['yield_shock', 'yield_divergence', 'yield_presure']):
+        import numpy as np
+        temp_df = self.df.copy()
+        temp_df['yield_shock'] = temp_df['US_bond_5y'] - temp_df['US_bond_5y'].shift(20)
+        temp_df['30ma_5y'] = temp_df['US_bond_5y'].rolling(window=30).mean()
+        temp_df['yield_divergence'] = (temp_df['yield_shock'] / temp_df['30ma_5y']) - 1
+        temp_df['yield_spread'] = temp_df['US_bond_5y'] - temp_df['US_bond_3m']
+        temp_df['spread_delta'] = temp_df['yield_spread'].diff(15)
+        temp_df['yield_presure'] = np.where(
+            temp_df['yield_spread'] < 0,
+            temp_df['spread_delta'],
+            0
+        )
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
+
+        if 'yield_shock' in indicator:
+            temp_df = temp_df.sort_values(by='yield_shock').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='yield_shock', sub_ly='daily_ret_a')
+        if 'yield_divergence' in indicator:
+            temp_df = temp_df.sort_values(by='yield_divergence').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='yield_divergence', sub_ly='daily_ret_a')
+        if 'yield_presure' in indicator:
+            temp_df = temp_df.sort_values(by='yield_presure').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='yield_presure', sub_ly='daily_ret_a')
