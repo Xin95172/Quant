@@ -189,9 +189,13 @@ class TXAnalyzer:
     def indicator_US_bond(self, demean: bool = False, indicator: [str] = ['yield_shock', 'yield_divergence', 'yield_presure']):
         import numpy as np
         temp_df = self.df.copy()
+
+        # 長債
+        if temp_df['US_bond_5y'].isna().sum() > 0:
+            temp_df['US_bond_5y'] = temp_df['US_bond_5y'].ffill()
         temp_df['yield_shock'] = temp_df['US_bond_5y'] - temp_df['US_bond_5y'].shift(20)
         temp_df['30ma_5y'] = temp_df['US_bond_5y'].rolling(window=30).mean()
-        temp_df['yield_divergence'] = (temp_df['yield_shock'] / temp_df['30ma_5y']) - 1
+        temp_df['yield_divergence'] = (temp_df['US_bond_5y'] / temp_df['30ma_5y']) - 1
         temp_df['yield_spread'] = temp_df['US_bond_5y'] - temp_df['US_bond_3m']
         temp_df['spread_delta'] = temp_df['yield_spread'].diff(15)
         temp_df['yield_presure'] = np.where(
@@ -199,6 +203,19 @@ class TXAnalyzer:
             temp_df['spread_delta'],
             0
         )
+
+        # 短債
+        if temp_df['US_bond_3m'].isna().sum() > 0:
+            temp_df['US_bond_3m'] = temp_df['US_bond_3m'].ffill()
+            ## 資金成本成長多少，越大資金越緊縮
+        temp_df['cash_crunch'] = temp_df['US_bond_3m'].diff(5)
+            ## 「現在」比「未來」更缺錢，大家寧願鎖定未來的低利率，也不願意現在借錢給別人。這是極度且立即的流動性壓力
+        temp_df['near_inversion'] = temp_df['US_bond_6m'] - temp_df['US_bond_3m']
+            ## 市場對資金水位感到恐慌
+        temp_df['near_yield_vol'] = temp_df['US_bond_3m'].rolling(10).std()
+
+        temp_df[['yield_shock', 'yield_divergence', 'yield_presure', 'cash_crunch', 'near_inversion', 'near_yield_vol']] = temp_df[['yield_shock', 'yield_divergence', 'yield_presure', 'cash_crunch', 'near_inversion', 'near_yield_vol']].shift(2)
+
         if demean:
             temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
             temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
@@ -221,3 +238,18 @@ class TXAnalyzer:
             temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
             return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='yield_presure', sub_ly='daily_ret_a')
+        if 'cash_crunch' in indicator:
+            temp_df = temp_df.sort_values(by='cash_crunch').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='cash_crunch', sub_ly='daily_ret_a')
+        if 'near_inversion' in indicator:
+            temp_df = temp_df.sort_values(by='near_inversion').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='near_inversion', sub_ly='daily_ret_a')
+        if 'near_yield_vol' in indicator:
+            temp_df = temp_df.sort_values(by='near_yield_vol').reset_index(drop=True)
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='near_yield_vol', sub_ly='daily_ret_a')
