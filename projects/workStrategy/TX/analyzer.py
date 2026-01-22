@@ -18,6 +18,9 @@ class TXAnalyzer:
         self.df['daily_ret_a'] = (self.df['Close_a'] / self.df['Open_a']) - 1
         self.df['cum_daily_ret_a'] = self.df['daily_ret_a'].cumsum()
     
+    def _get_statistics(self, ret_col: pd.Series):
+        return ret_col.describe()
+    
     def display_df(self):
         return self.df
 
@@ -155,3 +158,25 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='foreign_inflow', sub_ly='daily_ret_a')
+
+    def indicator_bull_or_bear(self, demean: bool = False):
+        temp_df = self.df.copy()
+        temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
+        temp_df['divergence'] = (((temp_df['Close'] + temp_df['Open_a']) / 2) / temp_df['15_ma']) - 1
+        temp_df['divergence'] = temp_df['divergence'].shift(1)
+        
+        # Drop NaN before sorting to prevent noise at the end of the plot
+        temp_df = temp_df.dropna(subset=['divergence'])
+        
+        if demean:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        else:
+            temp_df['daily_ret_a'] = temp_df['daily_ret_a']
+            temp_df['daily_ret'] = temp_df['daily_ret']
+        temp_df = temp_df.sort_values(by='divergence').reset_index(drop=True)
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        display(self._get_statistics(ret_col=temp_df.loc[temp_df['divergence'] > 0, 'daily_ret_a']))
+        display(self._get_statistics(ret_col=temp_df.loc[temp_df['divergence'] > 0, 'daily_ret']))
+        return plot.plot(temp_df, ly=['cum_daily_ret_a', 'cum_daily_ret'], ry='divergence', sub_ly='daily_ret_a', point_ry=0)
