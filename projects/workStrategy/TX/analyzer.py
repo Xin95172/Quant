@@ -25,6 +25,109 @@ class TXAnalyzer:
     def display_df(self):
         return self.df
 
+    def _calculate_metrics(self, returns: pd.Series) -> dict:
+        """
+        Calculate strategy performance metrics including advanced stats.
+        returns: Series of daily returns (or PnL percentages)
+        """
+        if returns.empty:
+            return {}
+
+        # 1. Basic Distributions
+        total_return = returns.sum() # Simple sum for daily percentage or log returns approximation
+        # Cumulative Compounded Return (for Total Return % accuracy)
+        # Assuming returns are simple returns:
+        cum_ret = (1 + returns).cumprod()
+        total_ret_pct = (cum_ret.iloc[-1] - 1) if not cum_ret.empty else 0.0
+        
+        # 2. Time Statistics
+        trading_days = len(returns)
+        # Annualized Factor (Crypto=365, Stock=252. TW Futures ~ 250)
+        ann_factor = 252 
+        
+        # CAGR
+        if trading_days > 0:
+            cagr = (1 + total_ret_pct) ** (ann_factor / trading_days) - 1
+        else:
+            cagr = 0.0
+
+        # Volatility (Annualized)
+        vol_ann = returns.std() * np.sqrt(ann_factor)
+
+        # Sharpe Ratio (Rf=0)
+        if vol_ann > 0:
+            sharpe = (cagr / vol_ann) 
+        else:
+            sharpe = 0.0
+
+        # 3. Drawdown Statistics
+        running_max = cum_ret.cummax()
+        drawdown = (cum_ret / running_max) - 1
+        max_dd = drawdown.min()
+        
+        # Max DD Duration (Days)
+        # Calculate streaks of drawdown < 0
+        is_dd = drawdown < 0
+        dd_duration = is_dd.astype(int).groupby((is_dd != is_dd.shift()).cumsum()).cumsum()
+        max_dd_duration = dd_duration.max() if not dd_duration.empty else 0
+
+        # 4. Trade Statistics (Win Rate, Odds, etc.)
+        # Filter non-zero returns to count "Active Trading Days"
+        active_rets = returns[returns != 0]
+        n_trades = len(active_rets)
+        
+        if n_trades > 0:
+            wins = active_rets[active_rets > 0]
+            losses = active_rets[active_rets < 0]
+            
+            n_win = len(wins)
+            win_rate = n_win / n_trades
+            
+            avg_win = wins.mean() if not wins.empty else 0.0
+            avg_loss = losses.mean() if not losses.empty else 0.0
+            
+            # Profit Factor
+            gross_profit = wins.sum()
+            gross_loss = abs(losses.sum())
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+            
+            # Odds (Avg Win / |Avg Loss|)
+            odds = avg_win / abs(avg_loss) if abs(avg_loss) > 0 else 0.0
+            
+            # Expectancy (Avg Return per trade)
+            avg_return = active_rets.mean() # 筆均
+            
+            # Kelly Criterion
+            # W - (1-W)/R  (W: Win Rate, R: Odds)
+            if odds > 0:
+                kelly = win_rate - (1 - win_rate) / odds
+            else:
+                kelly = 0.0
+        else:
+            win_rate = 0.0
+            avg_win = 0.0
+            avg_loss = 0.0
+            profit_factor = 0.0
+            odds = 0.0
+            avg_return = 0.0
+            kelly = 0.0
+
+        return {
+            'Total Return': f"{total_ret_pct*100:.2f}%",
+            'CAGR': f"{cagr*100:.2f}%",
+            'Volatility': f"{vol_ann*100:.2f}%",
+            'Sharpe': f"{sharpe:.2f}",
+            'Max Drawdown': f"{max_dd*100:.2f}%",
+            'Max DD Duration': f"{max_dd_duration} days",
+            'Profit Factor': f"{profit_factor:.2f}",
+            'Win Rate': f"{win_rate*100:.2f}%",
+            'Odds': f"{odds:.2f}",
+            'Avg Win': f"{avg_win*100:.2f}%",
+            'Avg Loss': f"{avg_loss*100:.2f}%",
+            'Avg Return (Exp)': f"{avg_return*100:.2f}%",
+            'Kelly': f"{kelly:.2f}"
+        }
+
     def update_df(self, df):
         self.df = df
         return self.df
@@ -207,7 +310,7 @@ class TXAnalyzer:
             ## 「現在」比「未來」更缺錢
         temp_df['near_inversion'] = temp_df['US_bond_6m'] - temp_df['US_bond_3m']
             ## 市場對資金水位感到恐慌
-        temp_df['near_yield_vol'] = temp_df['US_bond_3m'].rolling(20).std()
+        temp_df['near_yield_vol'] = temp_df['US_bond_3m'].rolling(10).std()
 
         temp_df[ind_list] = temp_df[ind_list].shift(2)
 
@@ -224,7 +327,19 @@ class TXAnalyzer:
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
             return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
-    def backtest(self):
+    def backtest(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical']):
+        """
+        回測策略 (Backtest Strategy)
+        
+        Args:
+            factors (list[str]): 選擇要啟用的因子列表。
+                - 'foreign_inflow': 籌碼因子 (外資 Z-score)
+                - 'yield_shock': 宏觀因子 (估值衝擊)
+                - 'near_yield_vol': 宏觀因子 (提款機效應/短債波動)
+                - 'near_inversion': 宏觀因子 (核彈警報/倒掛)
+                - 'holiday': 日曆因子 (長假風險)
+                - 'technical': 技術因子 (15MA 乖離)
+        """
         df = self.df.copy()
 
         # ===============================================================
@@ -237,27 +352,23 @@ class TXAnalyzer:
         # 2. 救命訊號 (Liquidity Crisis): 倒掛急陡 (6m - 3m)
         df['near_inversion'] = df['US_bond_6m'] - df['US_bond_3m']
         # 3. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
-        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() # 改成20天更穩
+        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
         
+        # 4. 趨勢過熱 (Overheated): 5年債乖離
+        df['30ma_5y'] = df['US_bond_5y'].rolling(window=30).mean()
+        df['yield_divergence'] = (df['US_bond_5y'] / df['30ma_5y']) - 1
+
         # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
-        macro_cols = ['yield_shock', 'near_inversion', 'near_yield_vol']
+        macro_cols = ['yield_shock', 'near_inversion', 'near_yield_vol', 'yield_divergence']
         df[macro_cols] = df[macro_cols].shift(2)
 
-        # --- B. 籌碼流向 (Flow - The Trend Setter) ---
-        # 外資 Z-score
-        df['foreign_inflow'] = (df['Net_Foreign_Investor'] - df['Net_Foreign_Investor'].rolling(20).mean()) / df['Net_Foreign_Investor'].rolling(20).std()
-        df['foreign_inflow'] = df['foreign_inflow'].shift(1) # T-1 下午出來，T日可用
-
-        # --- C. 日曆效應 (Calendar - The Time Decay) ---
+        # --- B. 日曆效應 (Calendar - The Time Decay) ---
         # 計算 Gap (T日 - T-1日的天數)
         df.index = pd.to_datetime(df.index)
         df['prev_date'] = df.index.to_series().shift(1)
-        df['gap'] = (df.index.to_series() - df['prev_date']).dt.days
-        # 注意：Gap是在 T日 開盤才知道，但策略是在 T-1 收盤決定要不要留倉
-        # 這裡我們用簡單規則：如果今天是週五(weekday=4)，視為潛在 Gap 風險
-        df['is_friday'] = np.where(df.index.dayofweek == 4, 1, 0)
+        df['holiday'] = (df.index.to_series() - df['prev_date']).dt.days
 
-        # --- D. 技術乖離 (Technical - The Entry Trigger) ---
+        # --- C. 技術乖離 (Technical - The Entry Trigger) ---
         # 15MA 乖離率
         df['15_ma'] = df['Close'].rolling(window=15).mean()
         df['divergence'] = (df['Close'] / df['15_ma']) - 1
@@ -279,60 +390,70 @@ class TXAnalyzer:
         # -----------------------------------------------------------
         # Layer 1: 基礎籌碼趨勢 (Base Trend)
         # -----------------------------------------------------------
-        # 邏輯：跟隨外資，但過濾掉中間的雜訊(內資吃豆腐區)
-        # 大買 (>1.5) -> 做多
-        # 大賣 (<-1.5) -> 做空
-        # 中間 -> 空手 (或逆勢，這裡先保守空手)
-        
-        BUY_THRESHOLD = 1.5
-        SELL_THRESHOLD = -1.5
-        
-        df.loc[df['foreign_inflow'] > BUY_THRESHOLD, ['pos_night', 'pos_day']] = 1.0
-        df.loc[df['foreign_inflow'] < SELL_THRESHOLD, ['pos_night', 'pos_day']] = -1.0
+        if 'foreign_inflow' in factors:
+            BUY_THRESHOLD = 1.5
+            SELL_THRESHOLD = -1.5
+            
+            df.loc[df['foreign_inflow'] > BUY_THRESHOLD, ['pos_night', 'pos_day']] = 1.0
+            df.loc[df['foreign_inflow'] < SELL_THRESHOLD, ['pos_night', 'pos_day']] = 0.0
 
         # -----------------------------------------------------------
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         # -----------------------------------------------------------
         
         # A. 估值衝擊 (Yield Shock) -> 禁止做多
-        # 如果長債升太快，成長股估值修正，多單全撤
-        mask_shock = df['yield_shock'] > 0.15
-        df.loc[mask_shock & (df['pos_night'] > 0), 'pos_night'] = 0.0
-        df.loc[mask_shock & (df['pos_day'] > 0), 'pos_day'] = 0.0
-        
-        # B. 提款機效應 (Yield Volatility) -> 日盤轉空，夜盤觀望
-        # 邏輯：波動大，外資白天提款，晚上美股震盪
-        mask_vol = df['near_yield_vol'] > 0.015
-        df.loc[mask_vol, 'pos_night'] = 0.0  # 夜盤避險不玩
-        df.loc[mask_vol, 'pos_day'] = -1.0   # 日盤強制做空 (勝率高)
+        if 'yield_shock' in factors:
+            mask_shock = df['yield_shock'] > 0.15
+            df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
 
-        # C. 核彈警報 (Inversion Crisis) -> 全面做空
-        # 邏輯：流動性枯竭，不管是誰都在逃
-        mask_crash = df['near_inversion'] > 0.3
-        df.loc[mask_crash, ['pos_night', 'pos_day']] = -1.0
+        # B. 提款機效應 (Yield Volatility) -> 觀望
+        if 'near_yield_vol' in factors:
+            mask_vol = df['near_yield_vol'] > 0.015
+            df.loc[mask_vol, ['pos_night', 'pos_day']] = 0.0
+
+        # C. 核彈警報 (Inversion Crisis) -> 全面平倉
+        if 'near_inversion' in factors:
+            mask_crash = df['near_inversion'] > 0.3
+            df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
+
+        # D. 債券乖離 (Yield Divergence) -> 觀望/休息
+        # 這裡假設如果開啟 yield_shock 也一併檢查 yield_divergence，或是預設檢查
+        if 'yield_shock' in factors:
+            # 乖離過大休息
+            df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
+            # 負乖離過大觀望 (原做空)
+            df.loc[df['yield_divergence'] < -0.05, ['pos_night', 'pos_day']] = 0.0
 
         # -----------------------------------------------------------
         # Layer 3: 日曆風控 (Holiday Risk)
         # -----------------------------------------------------------
-        # 邏輯：長假前夕(週五)，夜盤不留倉 (Gap風險期望值為負)
-        # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
-        df.loc[df['gap'] > 1, 'pos_night'] = 0.0
+        if 'holiday' in factors:
+            # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
+            df.loc[df['gap'] > 1, 'pos_night'] = 0.0
 
         # -----------------------------------------------------------
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
         # -----------------------------------------------------------
-        # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
-        # 這裡簡化邏輯：如果乖離過大，進行修正
-        
-        safe_zone = (~mask_crash) & (~mask_vol)
-        
-        # 夜盤喜歡均值回歸 (跌深買)
-        # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
-        df.loc[safe_zone & (df['signal_div_night'] < -0.05), 'pos_night'] = 1.0
-        
-        # 日盤喜歡動能 (跌深殺)
-        # 如果乖離 < -0.05 -> 日盤順勢空 (不要抄底)
-        df.loc[df['signal_div_day'] < -0.05, 'pos_day'] = -1.0
+        if 'technical' in factors:
+            # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
+            # 這裡我們簡單定義 "Macro Safe"，如果沒開 Macro 因子就預設 True
+            is_shock = (df['yield_shock'] > 0.15) if 'yield_shock' in factors else False
+            is_vol = (df['near_yield_vol'] > 0.015) if 'yield_vol' in factors else False
+            is_crash = (df['near_inversion'] > 0.3) if 'inversion' in factors else False
+            
+            safe_zone = (~is_crash) & (~is_vol)
+            
+            # 夜盤喜歡均值回歸 (跌深買)
+            # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
+            df.loc[safe_zone & (df['signal_div_night'] < -0.05), 'pos_night'] = 1.0
+            
+            # 日盤/夜盤 順勢做多 (正乖離強勢)
+            df.loc[df['signal_div_day'] > 0.0045, 'pos_day'] = 1.0
+            df.loc[safe_zone & (df['signal_div_night'] > 0.0045), 'pos_night'] = 1.0
+
+            # 日盤原本有做空邏輯，現移除或改觀望
+            # 如果乖離 < -0.05 -> 觀望
+            df.loc[df['signal_div_day'] < -0.05, 'pos_day'] = 0.0
 
         # ===============================================================
         # 3. 計算回測結果 (Backtest PnL)
@@ -342,5 +463,19 @@ class TXAnalyzer:
         
         # 基準：Buy & Hold
         df['cum_bnh'] = (df['daily_ret_a'] + df['daily_ret']).cumsum()
+
+        # ===============================================================
+        # 4. 顯示績效統計 (Performance Metrics)
+        # ===============================================================
+        print("=== Performance Metrics ===")
+        # Strategy Metrics
+        strat_metrics = self._calculate_metrics(df['strat_ret'])
+        # Benchmark Metrics
+        benchmark_ret = df['daily_ret_a'] + df['daily_ret']
+        bnh_metrics = self._calculate_metrics(benchmark_ret)
+        
+        # Combine into DataFrame
+        metrics_df = pd.DataFrame([strat_metrics, bnh_metrics], index=['Strategy', 'Benchmark']).T
+        display(metrics_df.T)
 
         return plot.plot(df, ly=['cum_strat', 'cum_bnh'])
