@@ -388,16 +388,6 @@ class TXAnalyzer:
         df['pos_day'] = 0.0
 
         # -----------------------------------------------------------
-        # Layer 1: 基礎籌碼趨勢 (Base Trend)
-        # -----------------------------------------------------------
-        if 'foreign_inflow' in factors:
-            BUY_THRESHOLD = 1.5
-            SELL_THRESHOLD = -1.5
-            
-            df.loc[df['foreign_inflow'] > BUY_THRESHOLD, ['pos_night', 'pos_day']] = 1.0
-            df.loc[df['foreign_inflow'] < SELL_THRESHOLD, ['pos_night', 'pos_day']] = 0.0
-
-        # -----------------------------------------------------------
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         # -----------------------------------------------------------
         
@@ -407,9 +397,11 @@ class TXAnalyzer:
             df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
 
         # B. 提款機效應 (Yield Volatility) -> 觀望
+            ## 可以考慮 < 0.013 加碼
+            ## 在考慮要不要 > 0.015 夜盤也不做，減少 overfitting
         if 'near_yield_vol' in factors:
             mask_vol = df['near_yield_vol'] > 0.015
-            df.loc[mask_vol, ['pos_night', 'pos_day']] = 0.0
+            df.loc[mask_vol, ['pos_day']] = 0.0
 
         # C. 核彈警報 (Inversion Crisis) -> 全面平倉
         if 'near_inversion' in factors:
@@ -421,15 +413,15 @@ class TXAnalyzer:
         if 'yield_shock' in factors:
             # 乖離過大休息
             df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
-            # 負乖離過大觀望 (原做空)
-            df.loc[df['yield_divergence'] < -0.05, ['pos_night', 'pos_day']] = 0.0
+            df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
 
         # -----------------------------------------------------------
         # Layer 3: 日曆風控 (Holiday Risk)
         # -----------------------------------------------------------
         if 'holiday' in factors:
             # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
-            df.loc[df['gap'] > 1, 'pos_night'] = 0.0
+            df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
+            df.loc[df['holiday'].shift(1) > 2, 'pos_night'] = 1
 
         # -----------------------------------------------------------
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
