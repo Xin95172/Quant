@@ -60,8 +60,8 @@ class TXAnalyzer:
     def _apply_signals_logic(self, df: pd.DataFrame, factors: list[str]) -> pd.DataFrame:
         """Helper to apply position sizing logic based on calculated factors."""
         # 初始化部位
-        df['pos_night'] = 0.0
-        df['pos_day'] = 0.0
+        df['pos_night'] = 1.0
+        df['pos_day'] = 1.0
 
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         
@@ -93,7 +93,6 @@ class TXAnalyzer:
         if 'holiday' in factors:
             # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
             df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
-            df.loc[df['holiday'].shift(1) > 2, 'pos_night'] = 1
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
         if 'technical' in factors:
