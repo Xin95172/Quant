@@ -288,7 +288,7 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         return plot.plot(temp_df, ly='cum_demeaned_daily_ret_a', x='index', ry = 'daily_ret', sub_ly=['cum_daily_ret_a'])
 
-    def indicator_gap_days(self, after_holiday: bool = False):
+    def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False):
         temp_df = self.df.copy()
         temp_df.index = pd.to_datetime(temp_df.index)
         temp_df['prev_date'] = temp_df.index.to_series().shift(1)
@@ -305,6 +305,21 @@ class TXAnalyzer:
         temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+
+        if sub_analysis:
+            temp_df = temp_df.loc[temp_df['gap'] > 2]
+            temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
+            temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
+            temp_df['divergence'] = temp_df['divergence'].shift(1)
+            temp_df = temp_df.dropna(subset=['divergence'])
+            temp_df = temp_df.sort_values(by='divergence').reset_index(drop=True)
+            temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+            temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+            temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
+            temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
+            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
@@ -418,7 +433,106 @@ class TXAnalyzer:
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
             return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
-    def backtest(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical']):
+    def check_risk_events(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical'], filter_tech_signal: bool = False) -> pd.DataFrame:
+        """
+        檢查並列出觸發風控的所有日期與原因 (Risk Event Log)
+        
+        Args:
+            factors: 因子列表
+            filter_tech_signal: 是否只顯示 "技術面有訊號 (Strong Buy/Dip Buy) 但被風控擋掉" 的事件
+        """
+        df = self.df.copy()
+        
+        # 1. 計算指標
+        df = self._calculate_factors(df)
+        
+        events = []
+        
+        # Helper function
+        def add_event(date, factor_name, value, action, tech_val):
+            # 判斷技術面是否有訊號 (Layer 4 想要進場的條件)
+            # 1. 強勢順勢: > 0.0045
+            # 2. 抄底(原邏輯): < -0.05
+            is_tech_signal = (tech_val > 0.0045) or (tech_val < -0.05)
+            
+            # 如果開啟過濾，且沒有技術訊號，則不加入
+            if filter_tech_signal and not is_tech_signal:
+                return
+
+            events.append({
+                'Date': date,
+                'Factor': factor_name,
+                'Value': value,
+                'Action': action,
+                'Tech_Signal': 'Buy' if is_tech_signal else 'Neutral',
+                'Divergence': tech_val
+            })
+
+        # --- Check Logic (Must match _apply_signals_logic) ---
+        
+        # A. 估值衝擊 (Yield Shock)
+        if 'yield_shock' in factors:
+            mask = df['yield_shock'] > 0.15
+            for date, val in df.loc[mask, 'yield_shock'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Yield Shock', val, 'Flat All (Shock > 0.15)', tech_val)
+
+        # B. 提款機效應 (Yield Volatility)
+        if 'near_yield_vol' in factors:
+            mask = df['near_yield_vol'] > 0.015
+            for date, val in df.loc[mask, 'near_yield_vol'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
+
+        # C. 核彈警報 (Inversion)
+        if 'near_inversion' in factors:
+            mask = df['near_inversion'] > 0.3
+            for date, val in df.loc[mask, 'near_inversion'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
+
+        # D. 債券乖離 (Yield Divergence)
+        if 'yield_shock' in factors:
+            # Overheat
+            mask_high = df['yield_divergence'] > 0.06
+            for date, val in df.loc[mask_high, 'yield_divergence'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
+            # Oversold
+            mask_low = df['yield_divergence'] < -0.04
+            for date, val in df.loc[mask_low, 'yield_divergence'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
+
+        # E. Holiday
+        if 'holiday' in factors:
+            mask = df['holiday'] > 2
+            for date, val in df.loc[mask, 'holiday'].items():
+                tech_val = df.loc[date, 'divergence']
+                add_event(date, 'Holiday', val, 'Flat Night (Holiday > 2)', tech_val)
+
+        # F. Technical (此處是技術面自己的出場，不算 conflict，但如果是 filter 模式通常不想看這個，因為這不是 Layer 2 block Layer 4)
+        if 'technical' in factors:
+            mask = df['divergence'] < 0.0045 # Technical Exit
+            # 如果是在找 "被 Layer 2 擋掉的"，這一段反而是 "Layer 4 自己不想做"
+            # 所以如果是 filter_tech_signal 模式，這一段應該不會有 output (因為 tech < 0.0045 不符合 Strong Buy)
+            # 除非 tech < -0.05 (Dip Buy)，這時候會有各 Conflict 嗎? 
+            # Tech說要 Dip Buy, 但 Tech 自己又說 < 0.0045 要 Flat Day? 
+            # 邏輯上： < -0.05 符合 Dip Buy，但 < 0.0045 也符合 Flat Day。
+            # 根據 apply_logic 順序，先設 pos_night = 1 (if dip buy)，然後 pos_day = 0 (if < 0.0045)。
+            # 所以夜盤會有部位。
+            
+            for date, val in df.loc[mask, 'divergence'].items():
+                add_event(date, 'Technical', val, 'Flat Day (Div < 0.0045)', val)
+
+        if not events:
+            return pd.DataFrame(columns=['Date', 'Factor', 'Value', 'Action', 'Tech_Signal', 'Divergence'])
+
+        res_df = pd.DataFrame(events)
+        res_df = res_df.sort_values(by='Date')
+        return res_df
+
+    def backtest(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical'], risk_log: bool = False):
         """
         回測策略 (Backtest Strategy)
         
@@ -463,5 +577,16 @@ class TXAnalyzer:
         # Combine into DataFrame
         metrics_df = pd.DataFrame([strat_metrics, bnh_metrics], index=['Strategy', 'Benchmark']).T
         display(metrics_df.T)
+
+        # ===============================================================
+        # 5. 顯示風控事件 (Risk Events)
+        # ===============================================================
+        if risk_log:
+            print("=== Risk Events Log (Top 20) ===")
+            risk_log = self.check_risk_events(factors)
+            if not risk_log.empty:
+                display(risk_log.tail(20)) # 顯示最近 20 筆，避免洗版
+            else:
+                print("No risk events triggered.")
 
         return plot.plot(df, ly=['cum_strat', 'cum_bnh'])
