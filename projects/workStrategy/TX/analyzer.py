@@ -83,7 +83,6 @@ class TXAnalyzer:
             df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
 
         # D. 債券乖離 (Yield Divergence) -> 觀望/休息
-        # 這裡假設如果開啟 yield_shock 也一併檢查 yield_divergence，或是預設檢查
         if 'yield_shock' in factors:
             # 乖離過大休息
             df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
@@ -91,7 +90,6 @@ class TXAnalyzer:
 
         # Layer 3: 日曆風控 (Holiday Risk)
         if 'holiday' in factors:
-            # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
             df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
