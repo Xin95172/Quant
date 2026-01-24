@@ -24,6 +24,100 @@ class TXAnalyzer:
     
     def display_df(self):
         return self.df
+    
+    def _calculate_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Helper to calculate all strategy factors."""
+        # --- A. 宏觀債券 (Macro - The Risk Radar) ---
+        # 1. 估值殺手 (Valuation): 20天長債變動
+        df['yield_shock'] = df['US_bond_5y'] - df['US_bond_5y'].shift(20)
+        # 2. 救命訊號 (Liquidity Crisis): 倒掛急陡 (6m - 3m)
+        df['near_inversion'] = df['US_bond_6m'] - df['US_bond_3m']
+        # 3. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
+        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
+        
+        # 4. 趨勢過熱 (Overheated): 5年債乖離
+        df['30ma_5y'] = df['US_bond_5y'].rolling(window=30).mean()
+        df['yield_divergence'] = (df['US_bond_5y'] / df['30ma_5y']) - 1
+
+        # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
+        macro_cols = ['yield_shock', 'near_inversion', 'near_yield_vol', 'yield_divergence']
+        df[macro_cols] = df[macro_cols].shift(2)
+
+        # --- B. 日曆效應 (Calendar - The Time Decay) ---
+        # 計算 Gap (T日 - T-1日的天數)
+        df.index = pd.to_datetime(df.index)
+        df['prev_date'] = df.index.to_series().shift(1)
+        df['holiday'] = (df.index.to_series() - df['prev_date']).dt.days
+
+        # --- C. 技術乖離 (Technical - The Entry Trigger) ---
+        # 15MA 乖離率
+        df['15_ma'] = df['Close'].rolling(window=15).mean()
+        df['divergence'] = (df['Close'] / df['15_ma']) - 1
+        df['divergence'] = df['divergence'].shift(1)
+        
+        return df
+
+    def _apply_signals_logic(self, df: pd.DataFrame, factors: list[str]) -> pd.DataFrame:
+        """Helper to apply position sizing logic based on calculated factors."""
+        # 初始化部位
+        df['pos_night'] = 0.0
+        df['pos_day'] = 0.0
+
+        # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
+        
+        # A. 估值衝擊 (Yield Shock) -> 禁止做多
+        if 'yield_shock' in factors:
+            mask_shock = df['yield_shock'] > 0.15
+            df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
+
+        # B. 提款機效應 (Yield Volatility) -> 觀望
+            ## 可以考慮 < 0.013 加碼
+            ## 在考慮要不要 > 0.015 夜盤也不做，減少 overfitting
+        if 'near_yield_vol' in factors:
+            mask_vol = df['near_yield_vol'] > 0.015
+            df.loc[mask_vol, ['pos_day']] = 0.0
+
+        # C. 核彈警報 (Inversion Crisis) -> 全面平倉
+        if 'near_inversion' in factors:
+            mask_crash = df['near_inversion'] > 0.3
+            df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
+
+        # D. 債券乖離 (Yield Divergence) -> 觀望/休息
+        # 這裡假設如果開啟 yield_shock 也一併檢查 yield_divergence，或是預設檢查
+        if 'yield_shock' in factors:
+            # 乖離過大休息
+            df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
+            df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
+
+        # Layer 3: 日曆風控 (Holiday Risk)
+        if 'holiday' in factors:
+            # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
+            df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
+            df.loc[df['holiday'].shift(1) > 2, 'pos_night'] = 1
+
+        # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
+        if 'technical' in factors:
+            # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
+            # 這裡我們簡單定義 "Macro Safe"，如果沒開 Macro 因子就預設 True
+            is_shock = (df['yield_shock'] > 0.15) if 'yield_shock' in factors else False
+            is_vol = (df['near_yield_vol'] > 0.015) if 'near_yield_vol' in factors else False
+            is_crash = (df['near_inversion'] > 0.3) if 'near_inversion' in factors else False
+            
+            safe_zone = (~is_crash) & (~is_vol)
+            
+            # 夜盤喜歡均值回歸 (跌深買)
+            # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
+            df.loc[safe_zone & (df['divergence'] < -0.05), 'pos_night'] = 1.0
+            
+            # 日盤/夜盤 順勢做多 (正乖離強勢)
+            df.loc[df['divergence'] > 0.0045, 'pos_day'] = 1.0
+            df.loc[safe_zone & (df['divergence'] > 0.0045), 'pos_night'] = 1.0
+
+            # 日盤原本有做空邏輯，現移除或改觀望
+            # 如果乖離 < -0.05 -> 觀望
+            df.loc[df['divergence'] < -0.05, 'pos_day'] = 0.0
+            
+        return df
 
     def _calculate_metrics(self, returns: pd.Series) -> dict:
         """
@@ -342,110 +436,13 @@ class TXAnalyzer:
         """
         df = self.df.copy()
 
-        # ===============================================================
         # 1. 指標計算 (Indicators Calculation)
-        # ===============================================================
+        df = self._calculate_factors(df)
 
-        # --- A. 宏觀債券 (Macro - The Risk Radar) ---
-        # 1. 估值殺手 (Valuation): 20天長債變動
-        df['yield_shock'] = df['US_bond_5y'] - df['US_bond_5y'].shift(20)
-        # 2. 救命訊號 (Liquidity Crisis): 倒掛急陡 (6m - 3m)
-        df['near_inversion'] = df['US_bond_6m'] - df['US_bond_3m']
-        # 3. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
-        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
-        
-        # 4. 趨勢過熱 (Overheated): 5年債乖離
-        df['30ma_5y'] = df['US_bond_5y'].rolling(window=30).mean()
-        df['yield_divergence'] = (df['US_bond_5y'] / df['30ma_5y']) - 1
-
-        # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
-        macro_cols = ['yield_shock', 'near_inversion', 'near_yield_vol', 'yield_divergence']
-        df[macro_cols] = df[macro_cols].shift(2)
-
-        # --- B. 日曆效應 (Calendar - The Time Decay) ---
-        # 計算 Gap (T日 - T-1日的天數)
-        df.index = pd.to_datetime(df.index)
-        df['prev_date'] = df.index.to_series().shift(1)
-        df['holiday'] = (df.index.to_series() - df['prev_date']).dt.days
-
-        # --- C. 技術乖離 (Technical - The Entry Trigger) ---
-        # 15MA 乖離率
-        df['15_ma'] = df['Close'].rolling(window=15).mean()
-        df['divergence'] = (df['Close'] / df['15_ma']) - 1
-        
-        # 訊號對齊：
-        # 預測夜盤 (T日晚) -> 用 T日 13:30 收盤的乖離 (需 shift 1 對齊到 T+1 的夜盤 row)
-        df['signal_div_night'] = df['divergence'].shift(1)
-        # 預測日盤 (T日早) -> 用 T-1日 13:30 收盤的乖離 (Shift 1)
-        df['signal_div_day'] = df['divergence'].shift(1)
-
-        # ===============================================================
         # 2. 策略邏輯 (Strategy Logic)
-        # ===============================================================
-        
-        # 初始化部位
-        df['pos_night'] = 0.0
-        df['pos_day'] = 0.0
+        df = self._apply_signals_logic(df, factors)
 
-        # -----------------------------------------------------------
-        # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
-        # -----------------------------------------------------------
-        
-        # A. 估值衝擊 (Yield Shock) -> 禁止做多
-        if 'yield_shock' in factors:
-            mask_shock = df['yield_shock'] > 0.15
-            df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
-
-        # B. 提款機效應 (Yield Volatility) -> 觀望
-            ## 可以考慮 < 0.013 加碼
-            ## 在考慮要不要 > 0.015 夜盤也不做，減少 overfitting
-        if 'near_yield_vol' in factors:
-            mask_vol = df['near_yield_vol'] > 0.015
-            df.loc[mask_vol, ['pos_day']] = 0.0
-
-        # C. 核彈警報 (Inversion Crisis) -> 全面平倉
-        if 'near_inversion' in factors:
-            mask_crash = df['near_inversion'] > 0.3
-            df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
-
-        # D. 債券乖離 (Yield Divergence) -> 觀望/休息
-        # 這裡假設如果開啟 yield_shock 也一併檢查 yield_divergence，或是預設檢查
-        if 'yield_shock' in factors:
-            # 乖離過大休息
-            df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
-            df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
-
-        # -----------------------------------------------------------
-        # Layer 3: 日曆風控 (Holiday Risk)
-        # -----------------------------------------------------------
-        if 'holiday' in factors:
-            # Gap > 1 代表這行是 "長假後的第一行" (如週一)，也就是包含 "長假前夜盤" (週五夜) 的那一行
-            df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
-            df.loc[df['holiday'].shift(1) > 2, 'pos_night'] = 1
-
-        # -----------------------------------------------------------
-        # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
-        # -----------------------------------------------------------
-        if 'technical' in factors:
-            # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
-            # 這裡我們簡單定義 "Macro Safe"，如果沒開 Macro 因子就預設 True
-            is_shock = (df['yield_shock'] > 0.15) if 'yield_shock' in factors else False
-            is_vol = (df['near_yield_vol'] > 0.015) if 'yield_vol' in factors else False
-            is_crash = (df['near_inversion'] > 0.3) if 'inversion' in factors else False
-            
-            safe_zone = (~is_crash) & (~is_vol)
-            
-            # 夜盤喜歡均值回歸 (跌深買)
-            # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
-            df.loc[safe_zone & (df['signal_div_night'] < -0.05), 'pos_night'] = 1.0
-            
-            # 日盤/夜盤 順勢做多 (正乖離強勢)
-            df.loc[df['signal_div_day'] > 0.0045, 'pos_day'] = 1.0
-            df.loc[safe_zone & (df['signal_div_night'] > 0.0045), 'pos_night'] = 1.0
-
-            # 日盤原本有做空邏輯，現移除或改觀望
-            # 如果乖離 < -0.05 -> 觀望
-            df.loc[df['signal_div_day'] < -0.05, 'pos_day'] = 0.0
+        # 3. 計算回測結果 (Backtest PnL)
 
         # ===============================================================
         # 3. 計算回測結果 (Backtest PnL)
