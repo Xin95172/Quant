@@ -75,15 +75,6 @@ class TXAnalyzer:
         mask_vol = df['near_yield_vol'] > 0.015
         df.loc[mask_vol, ['pos_day']] = 0.0
 
-        # C. 核彈警報 (Inversion Crisis) -> 全面平倉
-        mask_crash = df['near_inversion'] > 0.3
-        df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
-
-        # D. 債券乖離 (Yield Divergence) -> 觀望/休息
-        # 乖離過大休息
-        df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
-        df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
-
         # Layer 3: 日曆風控 (Holiday Risk)
         df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
 
@@ -92,16 +83,14 @@ class TXAnalyzer:
         # 這裡我們簡單定義 "Macro Safe"
         is_shock = df['yield_shock'] > 0.3
         is_vol = df['near_yield_vol'] > 0.015
-        is_crash = df['near_inversion'] > 0.3
         
-        safe_zone = (~is_shock) & (~is_crash) & (~is_vol)
+        safe_zone = (~is_shock) & (~is_vol)
         
-        # 夜盤喜歡均值回歸 (跌深買)
         # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
-        df.loc[safe_zone & (df['divergence'] < -0.05), 'pos_night'] = 1.0
+        df.loc[safe_zone & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
         
         # 日盤/夜盤 順勢做多 (正乖離強勢)
-        df.loc[df['divergence'] > 0.0045, 'pos_day'] = 1.0
+        df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
         df.loc[safe_zone & (df['divergence'] > 0.0045), 'pos_night'] = 1.0
 
         # 日盤原本有做空邏輯，現移除或改觀望
