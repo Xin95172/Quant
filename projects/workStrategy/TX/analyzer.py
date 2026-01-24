@@ -85,8 +85,7 @@ class TXAnalyzer:
         df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
 
         # Layer 3: 日曆風控 (Holiday Risk)
-        if df['divergence'] > 0.04:
-            df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
+        df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
         # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
