@@ -57,7 +57,7 @@ class TXAnalyzer:
         
         return df
 
-    def _apply_signals_logic(self, df: pd.DataFrame, factors: list[str]) -> pd.DataFrame:
+    def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to apply position sizing logic based on calculated factors."""
         # 初始化部位
         df['pos_night'] = 1.0
@@ -66,53 +66,48 @@ class TXAnalyzer:
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         
         # A. 估值衝擊 (Yield Shock) -> 禁止做多
-        if 'yield_shock' in factors:
-            mask_shock = df['yield_shock'] > 0.15
-            df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
+        mask_shock = df['yield_shock'] > 0.15
+        df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
 
         # B. 提款機效應 (Yield Volatility) -> 觀望
             ## 可以考慮 < 0.013 加碼
             ## 在考慮要不要 > 0.015 夜盤也不做，減少 overfitting
-        if 'near_yield_vol' in factors:
-            mask_vol = df['near_yield_vol'] > 0.015
-            df.loc[mask_vol, ['pos_day']] = 0.0
+        mask_vol = df['near_yield_vol'] > 0.015
+        df.loc[mask_vol, ['pos_day']] = 0.0
 
         # C. 核彈警報 (Inversion Crisis) -> 全面平倉
-        if 'near_inversion' in factors:
-            mask_crash = df['near_inversion'] > 0.3
-            df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
+        mask_crash = df['near_inversion'] > 0.3
+        df.loc[mask_crash, ['pos_night', 'pos_day']] = 0.0
 
         # D. 債券乖離 (Yield Divergence) -> 觀望/休息
-        if 'yield_shock' in factors:
-            # 乖離過大休息
-            df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
-            df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
+        # 乖離過大休息
+        df.loc[df['yield_divergence'] > 0.06, ['pos_night', 'pos_day']] = 0.0
+        df.loc[df['yield_divergence'] < -0.04, ['pos_night', 'pos_day']] = 0.0
 
         # Layer 3: 日曆風控 (Holiday Risk)
-        if 'holiday' in factors:
+        if df['divergence'] > 0.04:
             df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
-        if 'technical' in factors:
-            # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
-            # 這裡我們簡單定義 "Macro Safe"，如果沒開 Macro 因子就預設 True
-            is_shock = (df['yield_shock'] > 0.3) if 'yield_shock' in factors else False
-            is_vol = (df['near_yield_vol'] > 0.015) if 'near_yield_vol' in factors else False
-            is_crash = (df['near_inversion'] > 0.3) if 'near_inversion' in factors else False
-            
-            safe_zone = (~is_shock) & (~is_crash) & (~is_vol)
-            
-            # 夜盤喜歡均值回歸 (跌深買)
-            # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
-            df.loc[safe_zone & (df['divergence'] < -0.05), 'pos_night'] = 1.0
-            
-            # 日盤/夜盤 順勢做多 (正乖離強勢)
-            df.loc[df['divergence'] > 0.0045, 'pos_day'] = 1.0
-            df.loc[safe_zone & (df['divergence'] > 0.0045), 'pos_night'] = 1.0
+        # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
+        # 這裡我們簡單定義 "Macro Safe"
+        is_shock = df['yield_shock'] > 0.3
+        is_vol = df['near_yield_vol'] > 0.015
+        is_crash = df['near_inversion'] > 0.3
+        
+        safe_zone = (~is_shock) & (~is_crash) & (~is_vol)
+        
+        # 夜盤喜歡均值回歸 (跌深買)
+        # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
+        df.loc[safe_zone & (df['divergence'] < -0.05), 'pos_night'] = 1.0
+        
+        # 日盤/夜盤 順勢做多 (正乖離強勢)
+        df.loc[df['divergence'] > 0.0045, 'pos_day'] = 1.0
+        df.loc[safe_zone & (df['divergence'] > 0.0045), 'pos_night'] = 1.0
 
-            # 日盤原本有做空邏輯，現移除或改觀望
-            # 如果乖離 < -0.05 -> 觀望
-            df.loc[df['divergence'] < 0.0045, 'pos_day'] = 0.0
+        # 日盤原本有做空邏輯，現移除或改觀望
+        # 如果乖離 < -0.05 -> 觀望
+        df.loc[df['divergence'] < 0.0045, 'pos_day'] = 0.0
             
         return df
 
@@ -433,7 +428,7 @@ class TXAnalyzer:
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
             return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
-    def check_risk_events(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical'], filter_tech_signal: bool = False) -> pd.DataFrame:
+    def check_risk_events(self, filter_tech_signal: bool = False) -> pd.DataFrame:
         """
         檢查並列出觸發風控的所有日期與原因 (Risk Event Log)
         
@@ -471,59 +466,45 @@ class TXAnalyzer:
         # --- Check Logic (Must match _apply_signals_logic) ---
         
         # A. 估值衝擊 (Yield Shock)
-        if 'yield_shock' in factors:
-            mask = df['yield_shock'] > 0.15
-            for date, val in df.loc[mask, 'yield_shock'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Yield Shock', val, 'Flat All (Shock > 0.15)', tech_val)
+        mask = df['yield_shock'] > 0.15
+        for date, val in df.loc[mask, 'yield_shock'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Yield Shock', val, 'Flat All (Shock > 0.15)', tech_val)
 
         # B. 提款機效應 (Yield Volatility)
-        if 'near_yield_vol' in factors:
-            mask = df['near_yield_vol'] > 0.015
-            for date, val in df.loc[mask, 'near_yield_vol'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
+        mask = df['near_yield_vol'] > 0.015
+        for date, val in df.loc[mask, 'near_yield_vol'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
 
         # C. 核彈警報 (Inversion)
-        if 'near_inversion' in factors:
-            mask = df['near_inversion'] > 0.3
-            for date, val in df.loc[mask, 'near_inversion'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
+        mask = df['near_inversion'] > 0.3
+        for date, val in df.loc[mask, 'near_inversion'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
 
         # D. 債券乖離 (Yield Divergence)
-        if 'yield_shock' in factors:
-            # Overheat
-            mask_high = df['yield_divergence'] > 0.06
-            for date, val in df.loc[mask_high, 'yield_divergence'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
-            # Oversold
-            mask_low = df['yield_divergence'] < -0.04
-            for date, val in df.loc[mask_low, 'yield_divergence'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
+        # Overheat
+        mask_high = df['yield_divergence'] > 0.06
+        for date, val in df.loc[mask_high, 'yield_divergence'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
+        # Oversold
+        mask_low = df['yield_divergence'] < -0.04
+        for date, val in df.loc[mask_low, 'yield_divergence'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
 
         # E. Holiday
-        if 'holiday' in factors:
-            mask = df['holiday'] > 2
-            for date, val in df.loc[mask, 'holiday'].items():
-                tech_val = df.loc[date, 'divergence']
-                add_event(date, 'Holiday', val, 'Flat Night (Holiday > 2)', tech_val)
+        mask = df['holiday'] > 2
+        for date, val in df.loc[mask, 'holiday'].items():
+            tech_val = df.loc[date, 'divergence']
+            add_event(date, 'Holiday', val, 'Flat Night (Holiday > 2)', tech_val)
 
-        # F. Technical (此處是技術面自己的出場，不算 conflict，但如果是 filter 模式通常不想看這個，因為這不是 Layer 2 block Layer 4)
-        if 'technical' in factors:
-            mask = df['divergence'] < 0.0045 # Technical Exit
-            # 如果是在找 "被 Layer 2 擋掉的"，這一段反而是 "Layer 4 自己不想做"
-            # 所以如果是 filter_tech_signal 模式，這一段應該不會有 output (因為 tech < 0.0045 不符合 Strong Buy)
-            # 除非 tech < -0.05 (Dip Buy)，這時候會有各 Conflict 嗎? 
-            # Tech說要 Dip Buy, 但 Tech 自己又說 < 0.0045 要 Flat Day? 
-            # 邏輯上： < -0.05 符合 Dip Buy，但 < 0.0045 也符合 Flat Day。
-            # 根據 apply_logic 順序，先設 pos_night = 1 (if dip buy)，然後 pos_day = 0 (if < 0.0045)。
-            # 所以夜盤會有部位。
-            
-            for date, val in df.loc[mask, 'divergence'].items():
-                add_event(date, 'Technical', val, 'Flat Day (Div < 0.0045)', val)
+        # F. Technical
+        mask = df['divergence'] < 0.0045 # Technical Exit
+        for date, val in df.loc[mask, 'divergence'].items():
+            add_event(date, 'Technical', val, 'Flat Day (Div < 0.0045)', val)
 
         if not events:
             return pd.DataFrame(columns=['Date', 'Factor', 'Value', 'Action', 'Tech_Signal', 'Divergence'])
@@ -532,18 +513,9 @@ class TXAnalyzer:
         res_df = res_df.sort_values(by='Date')
         return res_df
 
-    def backtest(self, factors: list[str] = ['foreign_inflow', 'yield_shock', 'near_yield_vol', 'near_inversion', 'holiday', 'technical'], risk_log: bool = False):
+    def backtest(self, risk_log: bool = False):
         """
         回測策略 (Backtest Strategy)
-        
-        Args:
-            factors (list[str]): 選擇要啟用的因子列表。
-                - 'foreign_inflow': 籌碼因子 (外資 Z-score)
-                - 'yield_shock': 宏觀因子 (估值衝擊)
-                - 'near_yield_vol': 宏觀因子 (提款機效應/短債波動)
-                - 'near_inversion': 宏觀因子 (核彈警報/倒掛)
-                - 'holiday': 日曆因子 (長假風險)
-                - 'technical': 技術因子 (15MA 乖離)
         """
         df = self.df.copy()
 
@@ -551,7 +523,7 @@ class TXAnalyzer:
         df = self._calculate_factors(df)
 
         # 2. 策略邏輯 (Strategy Logic)
-        df = self._apply_signals_logic(df, factors)
+        df = self._apply_signals_logic(df)
 
         # 3. 計算回測結果 (Backtest PnL)
 
@@ -583,7 +555,7 @@ class TXAnalyzer:
         # ===============================================================
         if risk_log:
             print("=== Risk Events Log (Top 20) ===")
-            risk_log = self.check_risk_events(factors)
+            risk_log = self.check_risk_events()
             if not risk_log.empty:
                 display(risk_log.tail(20)) # 顯示最近 20 筆，避免洗版
             else:
