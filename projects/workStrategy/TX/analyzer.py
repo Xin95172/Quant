@@ -98,11 +98,11 @@ class TXAnalyzer:
         if 'technical' in factors:
             # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
             # 這裡我們簡單定義 "Macro Safe"，如果沒開 Macro 因子就預設 True
-            is_shock = (df['yield_shock'] > 0.15) if 'yield_shock' in factors else False
+            is_shock = (df['yield_shock'] > 0.3) if 'yield_shock' in factors else False
             is_vol = (df['near_yield_vol'] > 0.015) if 'near_yield_vol' in factors else False
             is_crash = (df['near_inversion'] > 0.3) if 'near_inversion' in factors else False
             
-            safe_zone = (~is_crash) & (~is_vol)
+            safe_zone = (~is_shock) & (~is_crash) & (~is_vol)
             
             # 夜盤喜歡均值回歸 (跌深買)
             # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
@@ -114,7 +114,7 @@ class TXAnalyzer:
 
             # 日盤原本有做空邏輯，現移除或改觀望
             # 如果乖離 < -0.05 -> 觀望
-            df.loc[df['divergence'] < -0.05, 'pos_day'] = 0.0
+            df.loc[df['divergence'] < 0.0045, 'pos_day'] = 0.0
             
         return df
 
