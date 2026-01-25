@@ -55,9 +55,9 @@ class TXAnalyzer:
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to apply position sizing logic based on calculated factors."""
         # 初始化部位
-            ## 用 0.5 sharpe 會升到 2.24、kelly 0.19，但 total return 會掉到 226.85 %
-        df['pos_night'] = 1.0
-        df['pos_day'] = 1.0
+            ## 用 0.5，sharpe 會升到 2.19、kelly 0.19，但 total return 會掉到 235.53 %
+        df['pos_night'] = 0.5
+        df['pos_day'] = 0.5
 
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         
@@ -65,23 +65,14 @@ class TXAnalyzer:
         mask_shock = df['yield_shock'] > 0.15
         df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
 
-        # B. 提款機效應 (Yield Volatility) -> 觀望
-            ## 可以考慮 < 0.013 加碼
-            ## 在考慮要不要 > 0.015 夜盤也不做，減少 overfitting
-        mask_vol = df['near_yield_vol'] > 0.015
-        df.loc[mask_vol, ['pos_day']] = 0.0
-
         # Layer 3: 日曆風控 (Holiday Risk)
-        df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
+        df.loc[df['holiday'] > 2, ['pos_day', 'pos_night']] = 0.0
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
         is_shock = df['yield_shock'] > 0.3
-        is_vol = df['near_yield_vol'] > 0.015
-        
-        safe_zone = (~is_shock) & (~is_vol)
         
         # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
-        df.loc[safe_zone & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
+        df.loc[~is_shock & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
         
         # 日盤順勢做多 (正乖離強勢)
         df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
@@ -361,7 +352,7 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
-    def indicator_US_bond(self, indicator: str):
+    def indicator_US_bond(self, indicator: str, sub_analysis: bool = False):
         import numpy as np
         temp_df = self.df.copy()
         ind_list = [
@@ -458,24 +449,6 @@ class TXAnalyzer:
         for date, val in df.loc[mask, 'near_yield_vol'].items():
             tech_val = df.loc[date, 'divergence']
             add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
-
-        # C. 核彈警報 (Inversion)
-        # mask = df['near_inversion'] > 0.3
-        # for date, val in df.loc[mask, 'near_inversion'].items():
-        #     tech_val = df.loc[date, 'divergence']
-        #     add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
-
-        # D. 債券乖離 (Yield Divergence)
-        # Overheat
-        # mask_high = df['yield_divergence'] > 0.06
-        # for date, val in df.loc[mask_high, 'yield_divergence'].items():
-        #     tech_val = df.loc[date, 'divergence']
-        #     add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
-        # Oversold
-        # mask_low = df['yield_divergence'] < -0.04
-        # for date, val in df.loc[mask_low, 'yield_divergence'].items():
-        #     tech_val = df.loc[date, 'divergence']
-        #     add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
 
         # E. Holiday
         mask = df['holiday'] > 2
