@@ -30,17 +30,12 @@ class TXAnalyzer:
         # --- A. 宏觀債券 (Macro - The Risk Radar) ---
         # 1. 估值殺手 (Valuation): 20天長債變動
         df['yield_shock'] = df['US_bond_5y'] - df['US_bond_5y'].shift(20)
-        # 2. 救命訊號 (Liquidity Crisis): 倒掛急陡 (6m - 3m)
-        df['near_inversion'] = df['US_bond_6m'] - df['US_bond_3m']
-        # 3. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
-        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
         
-        # 4. 趨勢過熱 (Overheated): 5年債乖離
-        df['30ma_5y'] = df['US_bond_5y'].rolling(window=30).mean()
-        df['yield_divergence'] = (df['US_bond_5y'] / df['30ma_5y']) - 1
+        # 2. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
+        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
 
         # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
-        macro_cols = ['yield_shock', 'near_inversion', 'near_yield_vol', 'yield_divergence']
+        macro_cols = ['yield_shock', 'near_yield_vol']
         df[macro_cols] = df[macro_cols].shift(2)
 
         # --- B. 日曆效應 (Calendar - The Time Decay) ---
@@ -60,6 +55,7 @@ class TXAnalyzer:
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to apply position sizing logic based on calculated factors."""
         # 初始化部位
+            ## 用 0.5 sharpe 會升到 2.24、kelly 0.19，但 total return 會掉到 226.85 %
         df['pos_night'] = 1.0
         df['pos_day'] = 1.0
 
@@ -79,8 +75,6 @@ class TXAnalyzer:
         df.loc[df['holiday'] > 2, 'pos_night'] = 0.0
 
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
-        # 只有在沒有 Macro 警報 (Level 2 & 3 未觸發) 時，才用乖離率做逆勢/順勢加碼
-        # 這裡我們簡單定義 "Macro Safe"
         is_shock = df['yield_shock'] > 0.3
         is_vol = df['near_yield_vol'] > 0.015
         
@@ -89,9 +83,8 @@ class TXAnalyzer:
         # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
         df.loc[safe_zone & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
         
-        # 日盤/夜盤 順勢做多 (正乖離強勢)
+        # 日盤順勢做多 (正乖離強勢)
         df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
-        df.loc[safe_zone & (df['divergence'] > 0.0045), 'pos_night'] = 1.0
 
         # 日盤原本有做空邏輯，現移除或改觀望
         # 如果乖離 < -0.05 -> 觀望
@@ -434,9 +427,10 @@ class TXAnalyzer:
         # Helper function
         def add_event(date, factor_name, value, action, tech_val):
             # 判斷技術面是否有訊號 (Layer 4 想要進場的條件)
-            # 1. 強勢順勢: > 0.0045
-            # 2. 抄底(原邏輯): < -0.05
-            is_tech_signal = (tech_val > 0.0045) or (tech_val < -0.05)
+            # 1. Day Momentum: > 0.0045
+            # 2. Night Safe Trend: > 0.0035
+            # 只要 > 0.0035 就視為有技術面訊號
+            is_tech_signal = (tech_val > 0.0035)
             
             # 如果開啟過濾，且沒有技術訊號，則不加入
             if filter_tech_signal and not is_tech_signal:
@@ -466,22 +460,22 @@ class TXAnalyzer:
             add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
 
         # C. 核彈警報 (Inversion)
-        mask = df['near_inversion'] > 0.3
-        for date, val in df.loc[mask, 'near_inversion'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
+        # mask = df['near_inversion'] > 0.3
+        # for date, val in df.loc[mask, 'near_inversion'].items():
+        #     tech_val = df.loc[date, 'divergence']
+        #     add_event(date, 'Inversion', val, 'Flat All (Inversion > 0.3)', tech_val)
 
         # D. 債券乖離 (Yield Divergence)
         # Overheat
-        mask_high = df['yield_divergence'] > 0.06
-        for date, val in df.loc[mask_high, 'yield_divergence'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
+        # mask_high = df['yield_divergence'] > 0.06
+        # for date, val in df.loc[mask_high, 'yield_divergence'].items():
+        #     tech_val = df.loc[date, 'divergence']
+        #     add_event(date, 'Yield Div', val, 'Flat All (Div > 0.06)', tech_val)
         # Oversold
-        mask_low = df['yield_divergence'] < -0.04
-        for date, val in df.loc[mask_low, 'yield_divergence'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
+        # mask_low = df['yield_divergence'] < -0.04
+        # for date, val in df.loc[mask_low, 'yield_divergence'].items():
+        #     tech_val = df.loc[date, 'divergence']
+        #     add_event(date, 'Yield Div', val, 'Flat All (Div < -0.04)', tech_val)
 
         # E. Holiday
         mask = df['holiday'] > 2
