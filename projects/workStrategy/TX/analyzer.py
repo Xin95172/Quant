@@ -56,8 +56,8 @@ class TXAnalyzer:
         """Helper to apply position sizing logic based on calculated factors."""
         # 初始化部位
             ## 用 0.5，sharpe 會升到 2.19、kelly 0.19，但 total return 會掉到 235.53 %
-        df['pos_night'] = 0.5
-        df['pos_day'] = 0.5
+        df['pos_night'] = 1.0
+        df['pos_day'] = 1.0
 
         # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
         
@@ -71,10 +71,10 @@ class TXAnalyzer:
         # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
         is_shock = df['yield_shock'] > 0.3
         
-        # 如果乖離 < -0.05 且 宏觀安全 -> 夜盤嘗試抄底
+        # 夜盤在安全的地方做多
         df.loc[~is_shock & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
         
-        # 日盤順勢做多 (正乖離強勢)
+        # 日盤順勢做多
         df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
 
         # 日盤原本有做空邏輯，現移除或改觀望
@@ -444,17 +444,11 @@ class TXAnalyzer:
             tech_val = df.loc[date, 'divergence']
             add_event(date, 'Yield Shock', val, 'Flat All (Shock > 0.15)', tech_val)
 
-        # B. 提款機效應 (Yield Volatility)
-        mask = df['near_yield_vol'] > 0.015
-        for date, val in df.loc[mask, 'near_yield_vol'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Yield Vol', val, 'Flat Day (Vol > 0.015)', tech_val)
-
         # E. Holiday
         mask = df['holiday'] > 2
         for date, val in df.loc[mask, 'holiday'].items():
             tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Holiday', val, 'Flat Night (Holiday > 2)', tech_val)
+            add_event(date, 'Holiday', val, 'Flat All (Holiday > 2)', tech_val)
 
         # F. Technical
         mask = df['divergence'] < 0.0045 # Technical Exit
