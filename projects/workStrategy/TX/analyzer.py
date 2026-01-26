@@ -72,7 +72,7 @@ class TXAnalyzer:
         is_shock = df['yield_shock'] > 0.3
         
         # 夜盤在安全的地方做多
-        df.loc[~is_shock & (df['divergence'] > 0.0035), ['pos_night']] = 1.0
+        df.loc[~is_shock & (df['divergence'] > 0.0035), 'pos_night'] = 1.0
         
         # 日盤順勢做多
         df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
@@ -171,19 +171,19 @@ class TXAnalyzer:
             kelly = 0.0
 
         return {
-            'Total Return': f"{total_ret_pct*100:.2f}%",
-            'CAGR': f"{cagr*100:.2f}%",
-            'Volatility': f"{vol_ann*100:.2f}%",
-            'Sharpe': f"{sharpe:.2f}",
-            'Max Drawdown': f"{max_dd*100:.2f}%",
-            'Max DD Duration': f"{max_dd_duration} days",
-            'Profit Factor': f"{profit_factor:.2f}",
-            'Win Rate': f"{win_rate*100:.2f}%",
-            'Odds': f"{odds:.2f}",
-            'Avg Win': f"{avg_win*100:.2f}%",
-            'Avg Loss': f"{avg_loss*100:.2f}%",
-            'Avg Return (Exp)': f"{avg_return*100:.2f}%",
-            'Kelly': f"{kelly:.2f}"
+            'Total Return': total_ret_pct,
+            'CAGR': cagr,
+            'Volatility': vol_ann,
+            'Sharpe': sharpe,
+            'Max Drawdown': max_dd,
+            'Max DD Duration': max_dd_duration,
+            'Profit Factor': profit_factor,
+            'Win Rate': win_rate,
+            'Odds': odds,
+            'Avg Win': avg_win,
+            'Avg Loss': avg_loss,
+            'Avg Return (Exp)': avg_return,
+            'Kelly': kelly
         }
 
     def update_df(self, df):
@@ -497,7 +497,24 @@ class TXAnalyzer:
         
         # Combine into DataFrame
         metrics_df = pd.DataFrame([strat_metrics, bnh_metrics], index=['Strategy', 'Benchmark']).T
-        display(metrics_df.T)
+        
+        # Formatting function
+        def format_metrics(val, name):
+            if isinstance(val, (int, float)):
+                if '%' in name or 'Return' in name or 'CAGR' in name or 'Volatility' in name or 'Drawdown' in name or 'Win Rate' in name or 'Avg' in name:
+                     return f"{val*100:.2f}%"
+                elif 'Duration' in name:
+                    return f"{int(val)} days"
+                else:
+                    return f"{val:.2f}"
+            return val
+
+        # Apply formatting
+        formatted_df = metrics_df.copy()
+        for idx in formatted_df.index:
+            formatted_df.loc[idx] = formatted_df.loc[idx].apply(lambda x: format_metrics(x, idx))
+
+        display(formatted_df.T)
 
         # ===============================================================
         # 5. 顯示風控事件 (Risk Events)
@@ -511,3 +528,143 @@ class TXAnalyzer:
                 print("No risk events triggered.")
 
         return plot.plot(df, ly=['cum_strat', 'cum_bnh'])
+
+    def show_factor_distributions(self):
+        """
+        顯示策略使用之各項指標因子分佈情形 (Histograms & Statistics)
+        """
+        from plotly.subplots import make_subplots
+        
+        df = self.df.copy()
+        # 確保因子已計算
+        df = self._calculate_factors(df)
+        
+        # 定義主要因子 (對應 _apply_signals_logic 使用的)
+        factors = ['yield_shock', 'near_yield_vol', 'divergence', 'holiday']
+        
+        # 移除沒有該 flag 的情形 (例如 holiday 需要計算)
+        valid_factors = [f for f in factors if f in df.columns]
+
+        if not valid_factors:
+            print("No valid factors found to plot.")
+            return
+
+        # 1. 統計數據
+        print("=== Factor Statistics ===")
+        display(df[valid_factors].describe())
+        
+        # 2. 繪圖 (2x2 Grid)
+        rows = 2
+        cols = 2
+        fig = make_subplots(rows=rows, cols=cols, subplot_titles=valid_factors)
+        
+        for i, col in enumerate(valid_factors):
+            row = (i // cols) + 1
+            c = (i % cols) + 1
+            
+            # 過濾 NaN
+            series = df[col].dropna()
+            
+            fig.add_trace(
+                go.Histogram(x=series, name=col, nbinsx=100, histnorm='probability'),
+                row=row, col=c
+            )
+            
+        fig.update_layout(
+            title_text="Strategy Factors Distribution", 
+            showlegend=False,
+            height=700,
+        )
+        fig.show()
+
+    def show_performance_distributions(self, rolling_window: int = 126):
+        """
+        顯示策略績效指標的分佈 (Rolling Metrics & Returns Distribution)
+        rolling_window: 滾動窗口天數 (預設 126 天約半年)
+        包含所有指標: CAGR, Volatility, Sharpe, Max Drawdown, Max DD Duration, 
+        Profit Factor, Win Rate, Odds, Avg Win, Avg Loss, Avg Return (Exp), Kelly
+        """
+        from plotly.subplots import make_subplots
+        from tqdm import tqdm
+        
+        df = self.df.copy()
+        
+        # 自動執行回測邏輯以取得報酬率 (若尚未計算)
+        if 'strat_ret' not in df.columns:
+            df = self._calculate_factors(df)
+            df = self._apply_signals_logic(df)
+            df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
+
+        # 1. 準備滾動數據
+        daily_rets = df['strat_ret'].dropna()
+        n_samples = len(daily_rets)
+        
+        if n_samples < rolling_window:
+            print(f"Not enough data for rolling window {rolling_window}. Samples: {n_samples}")
+            return
+
+        rolling_metrics = []
+        
+        # 使用迴圈計算 (雖然較慢但最準確，且能重用 _calculate_metrics 邏輯)
+        # 為了效率，先取得 numpy array
+        dates = daily_rets.index.tolist()
+        
+        print(f"Calculating rolling metrics for {n_samples - rolling_window + 1} windows...")
+        for i in tqdm(range(n_samples - rolling_window + 1), desc="Rolling Metrics"):
+            window_slice = daily_rets.iloc[i : i+rolling_window]
+            # 呼叫既有的計算函數 (回傳的是 raw float dict)
+            metrics = self._calculate_metrics(window_slice)
+            # 加上日期標籤 (用窗口最後一天)
+            metrics['Date'] = dates[i+rolling_window-1]
+            rolling_metrics.append(metrics)
+            
+        r_df = pd.DataFrame(rolling_metrics).set_index('Date')
+        
+        # 移除 Total Return (因為是 Rolling 的，Total Return 只是該期間的報酬，用 CAGR 或 Avg Return 可能較好，但這裡還是會有)
+        # 這裡根據需求顯示 12 個指標
+        target_metrics = [
+            'CAGR', 'Volatility', 'Sharpe', 
+            'Max Drawdown', 'Max DD Duration', 'Profit Factor', 
+            'Win Rate', 'Odds', 'Kelly',
+            'Avg Win', 'Avg Loss', 'Avg Return (Exp)'
+        ]
+        
+        # 2. 統計摘要
+        print(f"=== Rolling Performance Statistics (Window: {rolling_window} days) ===")
+        display(r_df[target_metrics].describe())
+
+        # 3. 繪圖 (4x3 Grid)
+        rows = 4
+        cols = 3
+        fig = make_subplots(rows=rows, cols=cols, subplot_titles=target_metrics)
+        
+        for i, metric in enumerate(target_metrics):
+            if metric not in r_df.columns:
+                continue
+                
+            row = (i // cols) + 1
+            c = (i % cols) + 1
+            
+            # 過濾 inf / nan
+            series = r_df[metric].replace([np.inf, -np.inf], np.nan).dropna()
+            
+            # 根據指標設定不同顏色 (綠色好/紅色壞 的概念，或統一)
+            color = '#1f77b4' # default blue
+            if metric in ['Max Drawdown', 'Volatility', 'Avg Loss', 'Max DD Duration']:
+                color = '#d62728' # red for risk/less is better
+            elif metric in ['Sharpe', 'CAGR', 'Profit Factor', 'Win Rate', 'Kelly']:
+                color = '#2ca02c' # green for good
+                
+            fig.add_trace(
+                go.Histogram(x=series, name=metric, nbinsx=50, histnorm='probability', marker_color=color),
+                row=row, col=c
+            )
+            
+            # Add mean line annotation (optional/cluttered)
+        
+        fig.update_layout(
+            title_text=f"Rolling Strategy Performance Distributions (Window: {rolling_window} days)", 
+            showlegend=False,
+            height=1000,
+        )
+        fig.show()
