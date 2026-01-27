@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from module.plot_func import plot
-from typing import Optional, List
+from typing import Optional, List, Union, Tuple, Dict, Any
 from IPython.display import display
 
 class DisposalAnalyzer:
@@ -11,183 +11,44 @@ class DisposalAnalyzer:
     封裝了多種針對處置股事件的研究方法
     """
     def __init__(self, df: pd.DataFrame):
+        """
+        初始化分析器
+        :param df: 包含處置股數據的 DataFrame
+        """
         self.df = df
     
     def display_dataframe(self):
+        """
+        顯示當前的 DataFrame
+        """
         display(self.df)
-
-    @staticmethod
-    @staticmethod
-    def _parse_t_val(t_str: str) -> float:
-        """解析時間標籤 (e.g., 's+1', 'e-5') 為數值以利排序 - [Optimized]"""
-        if not isinstance(t_str, str) or not t_str: return 999.0
-        
-        # Fast parsing assuming standard format s/e +/- N
-        try:
-            prefix = t_str[0] # 's' or 'e'
-            # Check for sign
-            if '+' in t_str:
-                val = int(t_str.split('+')[1])
-            elif '-' in t_str or ('s' in t_str and len(t_str) > 1 and t_str[1] == '-'):
-                # s-3 or s3 (if s-3 is stored as s-3)
-                # Assuming 's-3' format or 's3' (negative not explicitly allowed in split old logic?)
-                # Old logic: if 's-' in t_str: val = -int(t_str.split('-')[-1])
-                parts = t_str.split('-')
-                val = -int(parts[1]) if len(parts) > 1 else 0
-            else:
-                # s3 (s+3) format or just number? Assuming sN is positive if no sign
-                val = int(t_str[1:])
-                
-            if prefix == 's': return float(val)
-            elif prefix == 'e': return 1000.0 + val
-        except:
-            return 999.0
-        return 999.0
-
-    def _compute_returns(self, df: pd.DataFrame, session: str) -> pd.DataFrame:
-        """根據 session 計算個股與大盤報酬"""
-        df = df.copy()
-        
-        # 動態建立分組欄位，避免 KeyError
-        group_cols = ['Stock_id']
-        for col in ['base_start_date', 'base_end_date']:
-            if col in df.columns:
-                group_cols.append(col)
-        
-        # 1. Stock Return
-        if session == 'position':
-            df['daily_ret'] = (df['Close'] / df['Open']) - 1
-            if 'TAIEX_Close' in df.columns:
-                df['market_ret'] = (df['TAIEX_Close'] / df['TAIEX_Open']) - 1
-        elif session == 'after_market':
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['daily_ret'] = (df['Open'] / df['prev_close']) - 1
-            if 'TAIEX_Close' in df.columns:
-                df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
-                df['market_ret'] = (df['TAIEX_Open'] / df['market_prev_close']) - 1
-        elif session == 'all':
-            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
-            df['daily_ret'] = (df['Close'] / df['prev_close']) - 1
-            if 'TAIEX_Close' in df.columns:
-                 df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
-                 df['market_ret'] = (df['TAIEX_Close'] / df['market_prev_close']) - 1
-
-        # 2. Abnormal Return
-        if 'market_ret' in df.columns:
-            df['abnormal_ret'] = df['daily_ret'] - df['market_ret']
-        else:
-            df['abnormal_ret'] = np.nan
-            
-        return df
-
-    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str, return_marks: str | None = None, v_lines: list | None = None):
-        """呼叫繪圖模組"""
-        # 排序
-        stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
-        stats = stats.sort_values('sort_key').drop(columns=['sort_key'])
-        
-        plot(
-            df=stats,
-            x=target_col,
-            ly='mean',       # 上圖：平均超額報酬
-            bar_col='count', # 下圖：樣本數
-            ly_type='bar',   # 上圖強制畫長條
-            mid_col='std',   # 中圖：標準差 (變更參數名稱)
-            note=note,
-            bar_kwargs={'width': 0.8},
-            return_marks=return_marks,
-            v_lines=['s+0', 'e+0']
-        )
-
-    def _display_dataframe(self, col: str, title: str):
-        """以 Pandas DataFrame 顯示分佈統計 (Days vs Events)"""
-        if col not in self.df.columns:
-            return
-            
-        print(f"\n[{title}]")
-        
-        # 1. Days Count (Rows)
-        days_counts = self.df[col].value_counts().rename('days_count')
-        
-        # 2. Event Count (Unique Events)
-        # 只有當 'Stock_id' 和 'event_start_date' 存在時才能算
-        if 'Stock_id' in self.df.columns and 'event_start_date' in self.df.columns:
-            # Drop duplicates to get unique events
-            unique_events = self.df.drop_duplicates(subset=['Stock_id', 'event_start_date'])
-            event_counts = unique_events[col].value_counts().rename('event_count')
-
-            extras = []
-            if 'interval' in unique_events.columns:
-                s_interval = unique_events['interval'].astype(str)
-
-                # 抓5分盤
-                c5 = unique_events[s_interval.str.contains('5')][col].value_counts().rename('5min_count')
-
-                # 抓20分盤
-                c20 = unique_events[s_interval.str.contains('20')][col].value_counts().rename('20min_count')
-                
-                extras = [c5, c20]
-
-            # Combine
-            stats = pd.concat([days_counts, event_counts] + extras, axis=1).fillna(0).astype(int)
-        else:
-            # Fallback if metadata missing
-            stats = pd.DataFrame(days_counts)
-            stats['event_count'] = 'N/A'
-            
-        stats.index.name = col
-        stats = stats.reset_index()
-        
-        # Percentage (based on Days)
-        total_days = len(self.df)
-        stats['days_pct'] = (stats['days_count'] / total_days * 100).map('{:.2f}%'.format)
-        
-        # Sort
-        if pd.api.types.is_numeric_dtype(stats[col]):
-            stats = stats.sort_values(col)
-        else:
-            stats = stats.sort_values('days_count', ascending=False)
-            
-        # Display
-        # Display
-        display_cols = [col, 'days_count', 'event_count', 'days_pct']
-        if '5min_count' in stats.columns:
-            display_cols.extend(['5min_count', '20min_count'])
-        
-        if 'event_count' in stats.columns and stats['event_count'].dtype != 'O':
-             # Format numbers
-             fmt = {'days_count': '{:,}', 'event_count': '{:,}'}
-             if '5min_count' in stats.columns:
-                 fmt.update({'5min_count': '{:,}', '20min_count': '{:,}'})
-                 
-             display(stats[display_cols].style.format(fmt))
-        else:
-             display(stats[display_cols])
 
     def overall_analysis(self, min_samples: int = 50, prefix: str = 't_label_'):
         """
         [Method 1] 多層級處置分析
         計算各時間點 (t_label_*) 的平均日報酬率並繪圖。
+        :param min_samples: 最小樣本數限制 (目前未被使用)
+        :param prefix: 時間標籤欄位的前綴
         """
         if self.df.empty:
             print("Dataframe is empty. Please check data source.")
             return
-
+        
+        df = self.df.copy()
         self._display_dataframe('condition', 'Disposal Condition Distribution')
 
         if 'disposal_level' in self.df.columns:
-
             # Correct Event Count Logic
             # Days Count: Number of rows (trading days)
             # Event Count: Number of distinct events (identified by 's+0' marker in corresponding t_label column)
             
             # 1. Calculate basic stats (based on Days)
-            level_stats = self.df.groupby('disposal_level')['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
+            level_stats = df.groupby('disposal_level')['daily_ret'].agg(['mean', 'count', 'std']).reset_index()
             level_stats = level_stats.rename(columns={'count': 'days_count'})
             
             # 2. Calculate true Event Count
             event_counts = {}
-            unique_levels = self.df['disposal_level'].dropna().unique()
+            unique_levels = df['disposal_level'].dropna().unique()
             level_map = {1: 'first', 2: 'second', 3: 'third', 4: 'fourth'}
             
             for lvl in unique_levels:
@@ -195,14 +56,11 @@ class DisposalAnalyzer:
                 suffix = level_map.get(lvl, f"level_{int(lvl)}")
                 t_col = f"t_label_{suffix}"
                 
-                if t_col in self.df.columns:
+                if t_col in df.columns:
                     # Count how many times 's+0' appears for this level
-                    # This assumes 's+0' is present for every event. If data is truncated, this might undercount,
-                    # but it's the most accurate proxy available in the Wide format.
-                    # We filter by disposal_level to ensure we are looking at the right rows
-                    count = self.df[
-                        (self.df['disposal_level'] == lvl) & 
-                        (self.df[t_col] == 's+0')
+                    count = df[
+                        (df['disposal_level'] == lvl) & 
+                        (df[t_col] == 's+0')
                     ].shape[0]
                     event_counts[lvl] = count
                 else:
@@ -237,6 +95,7 @@ class DisposalAnalyzer:
     def seprate_by_trend(self):
         """
         比較處置原因：利用 s-3 至 s-1 的累積漲跌幅區分超漲 (Overbought) / 超跌 (Oversold)
+        並重新定義 t_label 以識別連續處置事件。
         """
         if self.df.empty:
             print("Dataframe is empty. Please check data source.")
@@ -301,7 +160,6 @@ class DisposalAnalyzer:
             )
             display(ct)
         
-        
         # 重新定義 "t_label"
         # 邏輯：
         # 1. 識別連續處置事件
@@ -325,7 +183,6 @@ class DisposalAnalyzer:
         df_process['prev_level'] = df_process['disposal_level'].shift(1)
         cond_stock_change = df_process['Stock_id'] != df_process['prev_stock']
         is_level_1 = df_process['disposal_level'] == 1
-        prev_not_1 = df_process['prev_level'] != 1
         
         # Check for start date change to identify new event chains accurately
         df_process['prev_start_date'] = df_process['event_start_date'].shift(1)
@@ -404,11 +261,6 @@ class DisposalAnalyzer:
             pos_mask = s_vals >= 0
             neg_mask = s_vals < 0
             
-            # Fill logic
-            # Sub-masking relative to original array involves boolean indexing carefully
-            # Let's perform assignment on the subset directly? No, hard with mixed masks.
-            # Use temporary arrays for the subset
-            
             subset_labels = np.empty(len(diff_s), dtype=object)
             
             if pos_mask.any():
@@ -420,7 +272,7 @@ class DisposalAnalyzer:
 
         df_process['t_label'] = labels
 
-        # Debug: Keep intermediate columns
+        # Debug: Keep intermediate columns - Commented out for production
         # final_df = df_process.drop(columns=[
         #     'prev_stock', 'prev_level', 'new_group', 'group_id',
         #     'group_row_idx', 'base_start_t_idx', 'base_end_t_idx',
@@ -428,12 +280,14 @@ class DisposalAnalyzer:
         # ])
         final_df = df_process
 
-        final_df.to_csv('test.csv', index=False)
+        # final_df.to_csv('test.csv', index=False) # Removed debug output
         return final_df
 
     def plot_trend_return(self, df: pd.DataFrame, session: str = 'position'):
         """
         繪製不同趨勢下的每日平均報酬 (Daily Return)
+        :param df: 包含趨勢資訊的 DataFrame
+        :param session: 交易時段 ('position', 'after_market', 'all')
         """
         # 決定分組欄位：優先使用合併後的 base_start_date，其次用 event_start_date
         if 'base_start_date' not in df.columns:
@@ -456,8 +310,6 @@ class DisposalAnalyzer:
             print(f"缺少 {target_col}，無法繪圖")
             return
 
-        trend_stats = df.groupby(['direction', target_col])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
-        
         # 定義要繪製的子集配置: (標籤, 篩選函數)
         plot_configs = [('All', lambda d: pd.Series(True, index=d.index))]
         
@@ -501,109 +353,14 @@ class DisposalAnalyzer:
                     note=f'{direction} ({config_name}) - Daily Return - {session}'
                 )
         
-                stats.to_csv(f'test_{direction}.csv', index=False)
+                # stats.to_csv(f'test_{direction}.csv', index=False) # Removed debug output
 
-
-    def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int):
-        """
-        準備 3D/2D 繪圖所需的聚合數據
-        回傳:
-            grid_df: 聚合後的 DataFrame, 包含 relative_day_idx, ind_factor_mid, mean, std, count
-            x_tickvals: X軸刻度值 (連續索引)
-            x_ticktext: X軸刻度標籤 (s+N / e+N)
-        """
-        # 1. 準備數據
-        # 確保數據按時間排序，否則 shift 計算會錯誤
-        if 'Date' in df.columns:
-            df = df.sort_values(['Stock_id', 'Date'])
-        
-        df = self._compute_returns(df, session)
-        
-        # 動態建立分組欄位，避免 KeyError
-        group_cols = ['Stock_id']
-        for col in ['base_start_date', 'base_end_date']:
-            if col in df.columns:
-                group_cols.append(col)
-        
-        # 計算產業因子
-        if session == 'position':
-            df['close_-5'] = df.groupby(group_cols)['Ind_Close'].shift(5)
-            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
-            df['ind_factor'] = (df['close_-1']/df['close_-5']) - 1
-        elif session == 'after_market':
-            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
-            df['ind_factor'] = (df['Ind_Close'] / df['close_-1']) - 1
-
-        # 準備 X 軸: Relative Day
-        # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
-        # 因為 CSV 中的 relative_day 可能只是連續天數，沒有區分 e 系列
-        if 't_label' not in df.columns:
-             # 嘗試尋找替代欄位
-             target_col = next((c for c in ['t_label_first', 't_label_second', 't_label_third', 't_label_fourth'] if c in df.columns), None)
-             if target_col:
-                 df['t_label'] = df[target_col]
-        
-        if 't_label' in df.columns:
-             # 強制重算，以確保 e 系列的 1000+ 特性被保留
-             df['relative_day'] = df['t_label'].apply(self._parse_t_val)
-        elif 'relative_day' not in df.columns:
-             print("缺少 relative_day 或 t_label，無法定位時間軸。")
-             return None, None, None
-        
-        # 移除無法解析的天數
-        # 999.0 為 _parse_t_val 解析失敗的代碼，需排除
-        df = df[(df['relative_day'] < 2000) & (df['relative_day'] != 999.0)]
-
-        # 2. 準備 Y 軸: Industry Return Binning
-        q_low = df['ind_factor'].quantile(0.01)
-        q_high = df['ind_factor'].quantile(0.99)
-        df_filtered = df[(df['ind_factor'] >= q_low) & (df['ind_factor'] <= q_high)].copy()
-        
-        try:
-             df_filtered['ind_factor_bin'] = pd.cut(df_filtered['ind_factor'], bins=bins)
-             df_filtered['ind_factor_mid'] = df_filtered['ind_factor_bin'].apply(lambda x: x.mid).astype(float)
-        except Exception as e:
-            print(f"分組失敗: {e}")
-            return None, None, None
-
-        # 3. 計算統計量 (Aggregation)
-        grid_df = df_filtered.groupby(['relative_day', 'ind_factor_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
-        
-        if grid_df.empty:
-            print("無數據可繪圖")
-            return None, None, None
-
-        # 4. X軸標籤映射 (連續索引)
-        try:
-             # Get unique relative days sorted
-             unique_days = np.sort(df_filtered['relative_day'].unique())
-             
-             # Create a mapping from relative_day to Ordinal Index (0, 1, 2...)
-             day_map = {val: i for i, val in enumerate(unique_days)}
-             
-             # Apply mapping to grid_df
-             grid_df['relative_day_idx'] = grid_df['relative_day'].map(day_map)
-             
-             # Generate Ticks
-             def format_label(val):
-                 val = int(val)
-                 if val >= 1000:
-                     return f"e{val - 1000:+d}"
-                 else:
-                     return f"s{val:+d}"
-             
-             x_tickvals = np.arange(len(unique_days))
-             x_ticktext = [format_label(val) for val in unique_days]
-             
-             return grid_df, x_tickvals, x_ticktext
-
-        except Exception as e:
-            print(f"X軸標籤映射失敗: {e}")
-            return None, None, None
-
-    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20, split_by_direction: bool = True, use_browser: bool = True, show_metrics: list = None):
+    def plot_3d_return_surface(self, df: pd.DataFrame, session: str = 'position', bins: int = 20, split_by_direction: bool = True, use_browser: bool = True, show_metrics: Union[List[str], str] = None):
         """
         繪製 3D 表面圖 (Mean, Std, Count)
+        :param df: 資料來源
+        :param session: 交易時段
+        :param bins: 產業因子分組數量
         :param split_by_direction: 若 True 且 df 中包含 'direction' 欄位，則自動分開繪圖
         :param use_browser: 若 True，使用外部瀏覽器開啟圖表 (避免 IDE WebGL 崩潰)
         :param show_metrics: 指定要顯示的指標列表，預設為 ['mean']。可選值: 'mean', 'std', 'count'
@@ -712,11 +469,14 @@ class DisposalAnalyzer:
             else:
                 fig.show()
 
-    def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target, session: str = 'position', bins: int = 20, split_by_direction: bool = True):
+    def plot_2d_slice(self, df: pd.DataFrame, slice_by: str, target: Union[str, float], session: str = 'position', bins: int = 20, split_by_direction: bool = True):
         """
         繪製 2D 切片圖
+        :param df: 資料來源
         :param slice_by: 'ind_factor' (固定產業報酬，看時間走勢) 或 'time' (固定時間，看產業報酬影響)
         :param target: 切片目標值。若 slice_by='ind_factor' 則為 float (e.g. 0.05); 若 slice_by='time' 則為 str (e.g. 's+5') 或數值
+        :param session: 交易時段
+        :param bins: 產業因子分組數量
         :param split_by_direction: 若 True 且 df 中包含 'direction' 欄位，則自動分開繪圖
         """
         # 自動分組邏輯
@@ -838,8 +598,273 @@ class DisposalAnalyzer:
         fig.update_layout(width=1000, height=600)
         fig.show()
 
+    # --- Private Helper Methods ---
+
+    def _parse_t_val(self, t_str: str) -> float:
+        """
+        解析時間標籤 (e.g., 's+1', 'e-5') 為數值以利排序 - [Optimized]
+        :param t_str: 時間標籤字串
+        :return: 解析後的數值，s系列為 0-999，e系列為 1000+，解析失敗為 999.0
+        """
+        if not isinstance(t_str, str) or not t_str: return 999.0
+        
+        # Fast parsing assuming standard format s/e +/- N
+        try:
+            prefix = t_str[0] # 's' or 'e'
+            # Check for sign
+            if '+' in t_str:
+                val = int(t_str.split('+')[1])
+            elif '-' in t_str or ('s' in t_str and len(t_str) > 1 and t_str[1] == '-'):
+                # s-3 or s3 (if s-3 is stored as s-3)
+                parts = t_str.split('-')
+                val = -int(parts[1]) if len(parts) > 1 else 0
+            else:
+                # s3 (s+3) format or just number? Assuming sN is positive if no sign
+                val = int(t_str[1:])
+                
+            if prefix == 's': return float(val)
+            elif prefix == 'e': return 1000.0 + val
+        except:
+            return 999.0
+        return 999.0
+
+    def _compute_returns(self, df: pd.DataFrame, session: str) -> pd.DataFrame:
+        """
+        根據 session 計算個股與大盤報酬
+        :param df: 輸入的 DataFrame
+        :param session: 計算模式 ('position', 'after_market', 'all')
+        :return: 計算後包含報酬率的 DataFrame
+        """
+        df = df.copy()
+        
+        # 動態建立分組欄位，避免 KeyError
+        group_cols = ['Stock_id']
+        for col in ['base_start_date', 'base_end_date']:
+            if col in df.columns:
+                group_cols.append(col)
+        
+        # 1. Stock Return
+        if session == 'position':
+            df['daily_ret'] = (df['Close'] / df['Open']) - 1
+            if 'TAIEX_Close' in df.columns:
+                df['market_ret'] = (df['TAIEX_Close'] / df['TAIEX_Open']) - 1
+        elif session == 'after_market':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Open'] / df['prev_close']) - 1
+            if 'TAIEX_Close' in df.columns:
+                df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
+                df['market_ret'] = (df['TAIEX_Open'] / df['market_prev_close']) - 1
+        elif session == 'all':
+            df['prev_close'] = df.groupby(group_cols)['Close'].shift(1)
+            df['daily_ret'] = (df['Close'] / df['prev_close']) - 1
+            if 'TAIEX_Close' in df.columns:
+                 df['market_prev_close'] = df.groupby(group_cols)['TAIEX_Close'].shift(1)
+                 df['market_ret'] = (df['TAIEX_Close'] / df['market_prev_close']) - 1
+
+        # 2. Abnormal Return
+        if 'market_ret' in df.columns:
+            df['abnormal_ret'] = df['daily_ret'] - df['market_ret']
+        else:
+            df['abnormal_ret'] = np.nan
+            
+        return df
+
+    def _plot_stats(self, stats: pd.DataFrame, target_col: str, note: str, return_marks: Optional[str] = None, v_lines: Optional[list] = None):
+        """
+        呼叫繪圖模組繪製統計圖表
+        :param stats: 統計數據 DataFrame
+        :param target_col: X軸欄位名稱
+        :param note: 圖表標註/標題後綴
+        :param return_marks: (Optional) 回測標記
+        :param v_lines: (Optional) 垂直線位置列表
+        """
+        # 排序
+        stats['sort_key'] = stats[target_col].apply(self._parse_t_val)
+        stats = stats.sort_values('sort_key').drop(columns=['sort_key'])
+        
+        plot(
+            df=stats,
+            x=target_col,
+            ly='mean',       # 上圖：平均超額報酬
+            bar_col='count', # 下圖：樣本數
+            ly_type='bar',   # 上圖強制畫長條
+            mid_col='std',   # 中圖：標準差 (變更參數名稱)
+            note=note,
+            bar_kwargs={'width': 0.8},
+            return_marks=return_marks,
+            v_lines=['s+0', 'e+0']
+        )
+
+    def _display_dataframe(self, col: str, title: str):
+        """
+        以 Pandas DataFrame 顯示分佈統計 (Days vs Events)
+        :param col: 要統計的欄位名稱
+        :param title: 顯示標題
+        """
+        if col not in self.df.columns:
+            return
+            
+        print(f"\n[{title}]")
+        
+        # 1. Days Count (Rows)
+        days_counts = self.df[col].value_counts().rename('days_count')
+        
+        # 2. Event Count (Unique Events)
+        # 只有當 'Stock_id' 和 'event_start_date' 存在時才能算
+        if 'Stock_id' in self.df.columns and 'event_start_date' in self.df.columns:
+            # Drop duplicates to get unique events
+            unique_events = self.df.drop_duplicates(subset=['Stock_id', 'event_start_date'])
+            event_counts = unique_events[col].value_counts().rename('event_count')
+
+            extras = []
+            if 'interval' in unique_events.columns:
+                s_interval = unique_events['interval'].astype(str)
+
+                # 抓5分盤
+                c5 = unique_events[s_interval.str.contains('5')][col].value_counts().rename('5min_count')
+
+                # 抓20分盤
+                c20 = unique_events[s_interval.str.contains('20')][col].value_counts().rename('20min_count')
+                
+                extras = [c5, c20]
+
+            # Combine
+            stats = pd.concat([days_counts, event_counts] + extras, axis=1).fillna(0).astype(int)
+        else:
+            # Fallback if metadata missing
+            stats = pd.DataFrame(days_counts)
+            stats['event_count'] = 'N/A'
+            
+        stats.index.name = col
+        stats = stats.reset_index()
+        
+        # Percentage (based on Days)
+        total_days = len(self.df)
+        stats['days_pct'] = (stats['days_count'] / total_days * 100).map('{:.2f}%'.format)
+        
+        # Sort
+        if pd.api.types.is_numeric_dtype(stats[col]):
+            stats = stats.sort_values(col)
+        else:
+            stats = stats.sort_values('days_count', ascending=False)
+            
+        # Display
+        display_cols = [col, 'days_count', 'event_count', 'days_pct']
+        if '5min_count' in stats.columns:
+            display_cols.extend(['5min_count', '20min_count'])
+        
+        if 'event_count' in stats.columns and stats['event_count'].dtype != 'O':
+             # Format numbers
+             fmt = {'days_count': '{:,}', 'event_count': '{:,}'}
+             if '5min_count' in stats.columns:
+                 fmt.update({'5min_count': '{:,}', '20min_count': '{:,}'})
+                 
+             display(stats[display_cols].style.format(fmt))
+        else:
+             display(stats[display_cols])
+
+    def _prepare_surface_data(self, df: pd.DataFrame, session: str, bins: int) -> Tuple[Optional[pd.DataFrame], Optional[np.ndarray], Optional[List[str]]]:
+        """
+        準備 3D/2D 繪圖所需的聚合數據
+        :param df: 資料來源
+        :param session: 交易時段
+        :param bins: 分組數量
+        :return: (grid_df, x_tickvals, x_ticktext) 或 (None, None, None)
+        """
+        # 1. 準備數據
+        # 確保數據按時間排序，否則 shift 計算會錯誤
+        if 'Date' in df.columns:
+            df = df.sort_values(['Stock_id', 'Date'])
+        
+        df = self._compute_returns(df, session)
+        
+        # 動態建立分組欄位，避免 KeyError
+        group_cols = ['Stock_id']
+        for col in ['base_start_date', 'base_end_date']:
+            if col in df.columns:
+                group_cols.append(col)
+        
+        # 計算產業因子
+        if session == 'position':
+            df['close_-5'] = df.groupby(group_cols)['Ind_Close'].shift(5)
+            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['ind_factor'] = (df['close_-1']/df['close_-5']) - 1
+        elif session == 'after_market':
+            df['close_-1'] = df.groupby(group_cols)['Ind_Close'].shift(1)
+            df['ind_factor'] = (df['Ind_Close'] / df['close_-1']) - 1
+
+        # 準備 X 軸: Relative Day
+        # 優先嘗試從 t_label (或 t_label_first) 還原正確的 s/e 數值結構
+        # 因為 CSV 中的 relative_day 可能只是連續天數，沒有區分 e 系列
+        if 't_label' not in df.columns:
+             # 嘗試尋找替代欄位
+             target_col = next((c for c in ['t_label_first', 't_label_second', 't_label_third', 't_label_fourth'] if c in df.columns), None)
+             if target_col:
+                 df['t_label'] = df[target_col]
+        
+        if 't_label' in df.columns:
+             # 強制重算，以確保 e 系列的 1000+ 特性被保留
+             df['relative_day'] = df['t_label'].apply(self._parse_t_val)
+        elif 'relative_day' not in df.columns:
+             print("缺少 relative_day 或 t_label，無法定位時間軸。")
+             return None, None, None
+        
+        # 移除無法解析的天數
+        # 999.0 為 _parse_t_val 解析失敗的代碼，需排除
+        df = df[(df['relative_day'] < 2000) & (df['relative_day'] != 999.0)]
+
+        # 2. 準備 Y 軸: Industry Return Binning
+        q_low = df['ind_factor'].quantile(0.01)
+        q_high = df['ind_factor'].quantile(0.99)
+        df_filtered = df[(df['ind_factor'] >= q_low) & (df['ind_factor'] <= q_high)].copy()
+        
+        try:
+             df_filtered['ind_factor_bin'] = pd.cut(df_filtered['ind_factor'], bins=bins)
+             df_filtered['ind_factor_mid'] = df_filtered['ind_factor_bin'].apply(lambda x: x.mid).astype(float)
+        except Exception as e:
+            print(f"分組失敗: {e}")
+            return None, None, None
+
+        # 3. 計算統計量 (Aggregation)
+        grid_df = df_filtered.groupby(['relative_day', 'ind_factor_mid'])['daily_ret'].agg(['mean', 'std', 'count']).reset_index()
+        
+        if grid_df.empty:
+            print("無數據可繪圖")
+            return None, None, None
+
+        # 4. X軸標籤映射 (連續索引)
+        try:
+             # Get unique relative days sorted
+             unique_days = np.sort(df_filtered['relative_day'].unique())
+             
+             # Create a mapping from relative_day to Ordinal Index (0, 1, 2...)
+             day_map = {val: i for i, val in enumerate(unique_days)}
+             
+             # Apply mapping to grid_df
+             grid_df['relative_day_idx'] = grid_df['relative_day'].map(day_map)
+             
+             # Generate Ticks
+             def format_label(val):
+                 val = int(val)
+                 if val >= 1000:
+                     return f"e{val - 1000:+d}"
+                 else:
+                     return f"s{val:+d}"
+             
+             x_tickvals = np.arange(len(unique_days))
+             x_ticktext = [format_label(val) for val in unique_days]
+             
+             return grid_df, x_tickvals, x_ticktext
+
+        except Exception as e:
+            print(f"X軸標籤映射失敗: {e}")
+            return None, None, None
 
 # Backward compatibility
 def run_multi_level_analysis(df: pd.DataFrame):
+    """
+    向前相容的分析入口函數
+    :param df: 資料來源 DataFrame
+    """
     analyzer = DisposalAnalyzer(df)
     analyzer.overall_analysis()
