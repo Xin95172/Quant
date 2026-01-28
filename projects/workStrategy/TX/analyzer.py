@@ -30,13 +30,10 @@ class TXAnalyzer:
         # --- A. 宏觀債券 (Macro - The Risk Radar) ---
         # 1. 估值殺手 (Valuation): 20天長債變動
         df['yield_shock'] = df['US_bond_5y'] - df['US_bond_5y'].shift(20)
-        
-        # 2. 恐慌指數 (Panic/ATM): 短債波動率 (提款機效應)
-        df['near_yield_vol'] = df['US_bond_3m'].rolling(20).std() 
 
         # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
-        macro_cols = ['yield_shock', 'near_yield_vol']
-        df[macro_cols] = df[macro_cols].shift(2)
+        macro_cols = ['yield_shock']
+        df[macro_cols] = df[macro_cols].shift(3)
 
         # --- B. 日曆效應 (Calendar - The Time Decay) ---
         # 計算 Gap (T日 - T-1日的天數)
