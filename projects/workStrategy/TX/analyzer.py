@@ -204,14 +204,37 @@ class TXAnalyzer:
     def daily_ret(self):
         return plot.plot(self.df, ly=['cum_daily_ret', 'cum_daily_ret_a'])
 
-    def monthly_ret(self, session: str = 'night'):
+    def monthly_ret(self, mode: str = 'strategy'):
         """
-        session: 'night' (default) or 'day'
+        mode: 'strategy' (default), 'benchmark', 'night', 'day'
         """
-        target_col = 'daily_ret_a' if session == 'night' else 'daily_ret'
-        label = "Night Session" if session == 'night' else "Day Session"
-        
         df = self.df.copy()
+        
+        target_col = 'strat_ret'
+        label = "Strategy"
+        
+        if mode == 'strategy':
+            # Ensure strategy returns are calculated
+            if 'strat_ret' not in df.columns:
+                df = self._calculate_factors(df)
+                df = self._apply_signals_logic(df)
+                df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
+            target_col = 'strat_ret'
+            label = "Strategy"
+            
+        elif mode == 'benchmark':
+            df['benchmark'] = df['daily_ret_a'] + df['daily_ret']
+            target_col = 'benchmark'
+            label = "Buy & Hold (Benchmark)"
+            
+        elif mode == 'night':
+            target_col = 'daily_ret_a'
+            label = "Night Session (Raw)"
+            
+        elif mode == 'day':
+            target_col = 'daily_ret'
+            label = "Day Session (Raw)"
+        
         df['year'] = df.index.year
         df['month'] = df.index.month
         
