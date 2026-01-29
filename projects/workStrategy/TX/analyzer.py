@@ -15,9 +15,13 @@ class TXAnalyzer:
     
         self.df['daily_ret'] = (self.df['Close'] / self.df['Open']) - 1
         self.df['cum_daily_ret'] = self.df['daily_ret'].cumsum()
+        self.df['daily_pnl'] = self.df['Close'] - self.df['Open']
+        self.df['cum_daily_pnl'] = self.df['daily_pnl'].cumsum()
         
         self.df['daily_ret_a'] = (self.df['Close_a'] / self.df['Open_a']) - 1
         self.df['cum_daily_ret_a'] = self.df['daily_ret_a'].cumsum()
+        self.df['daily_pnl_a'] = self.df['Close_a'] - self.df['Open_a']
+        self.df['cum_daily_pnl_a'] = self.df['daily_pnl_a'].cumsum()
     
     def _get_statistics(self, ret_col: pd.Series):
         return ret_col.describe()
@@ -94,29 +98,33 @@ class TXAnalyzer:
 
         return df
 
-    def _calculate_metrics(self, returns: pd.Series) -> dict:
+    def _calculate_metrics(self, returns: pd.Series, point_version: bool = False) -> dict:
         """
         Calculate strategy performance metrics including advanced stats.
-        returns: Series of daily returns (or PnL percentages)
+        returns: Series of daily returns (percentage if point_version=False, points if True)
         """
         if returns.empty:
             return {}
 
         # 1. Basic Distributions
-        total_return = returns.sum() # Simple sum for daily percentage or log returns approximation
-        # Cumulative Compounded Return (for Total Return % accuracy)
-        # Assuming returns are simple returns:
-        cum_ret = (1 + returns).cumprod()
-        total_ret_pct = (cum_ret.iloc[-1] - 1) if not cum_ret.empty else 0.0
+        total_pnl = returns.sum()
+        
+        if point_version:
+            # Points Mode: Calculation is additive
+            cum_ret = returns.cumsum()
+            total_ret_val = total_pnl
+        else:
+            # Percentage Mode: Calculation is compounded
+            cum_ret = (1 + returns).cumprod()
+            total_ret_val = (cum_ret.iloc[-1] - 1) if not cum_ret.empty else 0.0
         
         # 2. Time Statistics
         trading_days = len(returns)
-        # Annualized Factor (Crypto=365, Stock=252. TW Futures ~ 250)
         ann_factor = 252 
         
-        # CAGR
-        if trading_days > 0:
-            cagr = (1 + total_ret_pct) ** (ann_factor / trading_days) - 1
+        # CAGR (Only for percentage mode)
+        if not point_version and trading_days > 0:
+            cagr = (1 + total_ret_val) ** (ann_factor / trading_days) - 1
         else:
             cagr = 0.0
 
@@ -124,18 +132,25 @@ class TXAnalyzer:
         vol_ann = returns.std() * np.sqrt(ann_factor)
 
         # Sharpe Ratio (Rf=0)
+        sharpe = 0.0
         if vol_ann > 0:
-            sharpe = (cagr / vol_ann) 
-        else:
-            sharpe = 0.0
-
+            if point_version:
+                # For point version, we use simplified annualized profit over volatility
+                ann_pnl = (total_pnl / trading_days) * ann_factor if trading_days > 0 else 0
+                sharpe = ann_pnl / vol_ann
+            else:
+                sharpe = cagr / vol_ann
+        
         # 3. Drawdown Statistics
         running_max = cum_ret.cummax()
-        drawdown = (cum_ret / running_max) - 1
+        if point_version:
+            drawdown = cum_ret - running_max # Points down
+        else:
+            drawdown = (cum_ret / running_max) - 1 # Pct down
+            
         max_dd = drawdown.min()
         
         # Max DD Duration (Days)
-        # Calculate streaks of drawdown < 0
         is_dd = drawdown < 0
         dd_duration = is_dd.astype(int).groupby((is_dd != is_dd.shift()).cumsum()).cumsum()
         max_dd_duration = dd_duration.max() if not dd_duration.empty else 0
@@ -182,11 +197,11 @@ class TXAnalyzer:
             kelly = 0.0
 
         return {
-            'Total Return': total_ret_pct,
+            'Total Return' if not point_version else 'Total PnL': total_ret_val,
             'CAGR': cagr,
             'Volatility': vol_ann,
             'Sharpe': sharpe,
-            'Max Drawdown': max_dd,
+            'Max Drawdown' if not point_version else 'Max Points DD': max_dd,
             'Max DD Duration': max_dd_duration,
             'Profit Factor': profit_factor,
             'Win Rate': win_rate,
@@ -204,7 +219,7 @@ class TXAnalyzer:
     def daily_ret(self):
         return plot.plot(self.df, ly=['cum_daily_ret', 'cum_daily_ret_a'])
 
-    def monthly_ret(self, mode: str = 'strategy'):
+    def monthly_ret(self, mode: str = 'strategy', point_version: bool = False):
         """
         mode: 'strategy' (default), 'benchmark', 'night', 'day'
         """
@@ -215,35 +230,46 @@ class TXAnalyzer:
         
         if mode == 'strategy':
             # Ensure strategy returns are calculated
-            if 'strat_ret' not in df.columns:
-                df = self._calculate_factors(df)
-                df = self._apply_signals_logic(df)
+            df = self._calculate_factors(df)
+            df = self._apply_signals_logic(df)
+            if point_version:
+                df['strat_ret'] = (df['daily_pnl_a'] * df['pos_night']) + (df['daily_pnl'] * df['pos_day'])
+            else:
                 df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
             target_col = 'strat_ret'
             label = "Strategy"
             
         elif mode == 'benchmark':
-            df['benchmark'] = df['daily_ret_a'] + df['daily_ret']
+            if point_version:
+                df['benchmark'] = df['daily_pnl_a'] + df['daily_pnl']
+            else:
+                df['benchmark'] = df['daily_ret_a'] + df['daily_ret']
             target_col = 'benchmark'
             label = "Buy & Hold (Benchmark)"
             
         elif mode == 'night':
-            target_col = 'daily_ret_a'
+            target_col = 'daily_pnl_a' if point_version else 'daily_ret_a'
             label = "Night Session (Raw)"
             
         elif mode == 'day':
-            target_col = 'daily_ret'
+            target_col = 'daily_pnl' if point_version else 'daily_ret'
             label = "Day Session (Raw)"
         
         df['year'] = df.index.year
         df['month'] = df.index.month
         
-        # Calculate monthly returns (compounded)
-        monthly_df = df.groupby(['year', 'month'])[target_col].apply(lambda x: (1 + x).prod() - 1).reset_index()
-        monthly_df['return_pct'] = monthly_df[target_col] * 100
+        # Calculate monthly returns (sum for points, compounded for percentages)
+        if point_version:
+            monthly_df = df.groupby(['year', 'month'])[target_col].sum().reset_index()
+            monthly_df['display_val'] = monthly_df[target_col]
+            unit = "pts"
+        else:
+            monthly_df = df.groupby(['year', 'month'])[target_col].apply(lambda x: (1 + x).prod() - 1).reset_index()
+            monthly_df['display_val'] = monthly_df[target_col] * 100
+            unit = "%"
         
         # Create Pivot Table
-        pivot_df = monthly_df.pivot(index='year', columns='month', values='return_pct')
+        pivot_df = monthly_df.pivot(index='year', columns='month', values='display_val')
         
         # Prepare annotations
         annotations = []
@@ -254,9 +280,9 @@ class TXAnalyzer:
                         dict(
                             x=x_idx, 
                             y=y_idx, 
-                            text=f"{val:.2f}", 
+                            text=f"{val:.1f}" if point_version else f"{val:.2f}", 
                             showarrow=False, 
-                            font=dict(color='black' if abs(val) < 5 else 'white')
+                            font=dict(color='black' if abs(val) < (100 if point_version else 5) else 'white')
                         )
                     )
                     
@@ -266,12 +292,12 @@ class TXAnalyzer:
             x=pivot_df.columns,
             y=pivot_df.index,
             colorscale='RdYlGn',
-            colorbar=dict(title='Return %'),
+            colorbar=dict(title=f'PnL ({unit})'),
             zmid=0
         ))
         
         fig.update_layout(
-            title=f'Monthly P&L Heatmap - {label}',
+            title=f"Monthly P&L Heatmap ({'Points' if point_version else 'Percentage'}) - {label}",
             xaxis_title='Month',
             yaxis_title='Year',
             yaxis=dict(autorange='reversed'), # Make recent years at bottom
@@ -554,7 +580,7 @@ class TXAnalyzer:
         res_df = res_df.sort_values(by='Date')
         return res_df
 
-    def backtest(self, risk_log: bool = False):
+    def backtest(self, risk_log: bool = False, point_version: bool = False):
         """
         回測策略 (Backtest Strategy)
         """
@@ -567,25 +593,26 @@ class TXAnalyzer:
         df = self._apply_signals_logic(df)
 
         # 3. 計算回測結果 (Backtest PnL)
+        if point_version:
+            df['strat_ret'] = (df['daily_pnl_a'] * df['pos_night']) + (df['daily_pnl'] * df['pos_day'])
+            df['benchmark_ret'] = (df['daily_pnl_a'] + df['daily_pnl'])
+            y_label = "Points"
+        else:
+            df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
+            df['benchmark_ret'] = (df['daily_ret_a'] + df['daily_ret'])
+            y_label = "Returns (%)"
 
-        # ===============================================================
-        # 3. 計算回測結果 (Backtest PnL)
-        # ===============================================================
-        df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
         df['cum_strat'] = df['strat_ret'].cumsum()
-        
-        # 基準：Buy & Hold
-        df['cum_bnh'] = (df['daily_ret_a'] + df['daily_ret']).cumsum()
+        df['cum_bnh'] = df['benchmark_ret'].cumsum()
 
         # ===============================================================
         # 4. 顯示績效統計 (Performance Metrics)
         # ===============================================================
-        print("=== Performance Metrics ===")
+        print(f"=== Performance Metrics ({'Points' if point_version else 'Percentage'}) ===")
         # Strategy Metrics
-        strat_metrics = self._calculate_metrics(df['strat_ret'])
+        strat_metrics = self._calculate_metrics(df['strat_ret'], point_version=point_version)
         # Benchmark Metrics
-        benchmark_ret = df['daily_ret_a'] + df['daily_ret']
-        bnh_metrics = self._calculate_metrics(benchmark_ret)
+        bnh_metrics = self._calculate_metrics(df['benchmark_ret'], point_version=point_version)
         
         # Combine into DataFrame
         metrics_df = pd.DataFrame([strat_metrics, bnh_metrics], index=['Strategy', 'Benchmark']).T
@@ -593,12 +620,20 @@ class TXAnalyzer:
         # Formatting function
         def format_metrics(val, name):
             if isinstance(val, (int, float)):
-                if '%' in name or 'Return' in name or 'CAGR' in name or 'Volatility' in name or 'Drawdown' in name or 'Win Rate' in name or 'Avg' in name:
+                if not point_version and ('Return' in name or 'CAGR' in name or 'Volatility' in name or 'Drawdown' in name or 'Win Rate' in name or 'Avg' in name):
                      return f"{val*100:.2f}%"
-                elif 'Duration' in name:
-                    return f"{int(val)} days"
-                else:
-                    return f"{val:.2f}"
+                elif point_version:
+                    if 'Win Rate' in name:
+                         return f"{val*100:.2f}%"
+                    elif 'Total PnL' in name or 'Points DD' in name or 'Avg' in name:
+                        return f"{val:.2f} pts"
+                    else:
+                        return f"{val:.2f}"
+                elif not point_version:
+                    if 'Duration' in name:
+                        return f"{int(val)} days"
+                    else:
+                        return f"{val:.2f}"
             return val
 
         # Apply formatting
@@ -613,9 +648,9 @@ class TXAnalyzer:
         # ===============================================================
         if risk_log:
             print("=== Risk Events Log (Top 20) ===")
-            risk_log = self.check_risk_events()
-            if not risk_log.empty:
-                display(risk_log.tail(20)) # 顯示最近 20 筆，避免洗版
+            risk_events = self.check_risk_events()
+            if not risk_events.empty:
+                display(risk_events.tail(20)) # 顯示最近 20 筆，避免洗版
             else:
                 print("No risk events triggered.")
 
