@@ -40,6 +40,7 @@ class TXAnalyzer:
         df.index = pd.to_datetime(df.index)
         df['prev_date'] = df.index.to_series().shift(1)
         df['holiday'] = (df.index.to_series() - df['prev_date']).dt.days
+        df['holiday'] = df['holiday'].shift(-1)
 
         # --- C. 技術乖離 (Technical - The Entry Trigger) ---
         # 15MA 乖離率
@@ -50,34 +51,47 @@ class TXAnalyzer:
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Helper to apply position sizing logic based on calculated factors."""
-        # 初始化部位
-            ## 用 0.5，sharpe 會升到 2.19、kelly 0.19，但 total return 會掉到 235.53 %
         df['pos_night'] = 1.0
         df['pos_day'] = 1.0
 
-        # Layer 2: 宏觀濾網 (Macro Overlays) - 權重高於籌碼
-        
-        # A. 估值衝擊 (Yield Shock) -> 禁止做多
-        mask_shock = df['yield_shock'] > 0.15
-        df.loc[mask_shock, ['pos_night', 'pos_day']] = 0.0
+        # --- 1. 定義輔助 Mask (條件) ---
+        # A. 宏觀條件
+        severe_shock = df['yield_shock'] > 0.3    # 重大衝擊
+        mild_shock = df['yield_shock'] > 0.15   # 輕微衝擊
+        safe_zone = df['yield_shock'] < 0.18   # 宏觀安全
 
-        # Layer 3: 日曆風控 (Holiday Risk)
-        df.loc[df['holiday'] > 2, ['pos_day', 'pos_night']] = 0.0
+        # B. 技術條件
+        strong_tech = df['divergence'] > 0.004    # 強勢
 
-        # Layer 4: 技術微調 (Technical Entry) - 僅在無重大宏觀風險時啟用
-        is_shock = df['yield_shock'] > 0.3
-        
-        # 夜盤在安全的地方做多
-        df.loc[~is_shock & (df['divergence'] > 0.0035), 'pos_night'] = 1.0
-        
-        # 日盤順勢做多
-        df.loc[~is_shock & (df['divergence'] > 0.0045), 'pos_day'] = 1.0
+        # C. 節日條件 (Gap)
+        # holiday 用 yield_shock 排序
+        is_abnormal = (df['yield_shock'] < -0.2) | (df['yield_shock'] > 0.35)
 
-        # 日盤原本有做空邏輯，現移除或改觀望
-        # 如果乖離 < -0.05 -> 觀望
-        df.loc[df['divergence'] < 0.0045, 'pos_day'] = 0.0
-            
+        # --- 2. 執行風控層 (Layers) ---
+        
+        # Layer 2: 宏觀風控 (Macro)
+        df.loc[mild_shock, ['pos_night', 'pos_day']] = 0.0
+
+        # Layer 3: 節日風控 (Holiday)
+        # 3.1 放假前一天：
+        df.loc[(df['holiday'].shift(1) > 2) & is_abnormal, 'pos_night'] = 0.0
+        # 3.2 放假後第一天：
+        df.loc[(df['holiday'].shift(1) > 2) & ~safe_zone, 'pos_day'] = 0.0
+
+        # --- 3. 執行進場層 (Entries) ---
+
+        # Layer 4: 技術進場 (Technical)
+        # 4.1 夜盤進場 (無重大衝擊 + 技術強)
+        df.loc[~severe_shock & strong_tech, 'pos_night'] = 1.0
+        
+        # Layer 5: 特別例外 (Overrides)
+        # 5.1 日盤離場：原本乖離不夠要砍單...
+        df.loc[~strong_tech, 'pos_day'] = 0.0
+        
+        # 5.2 聰明接刀 (Smart Re-entry):
+        # 但如果是「剛收假」且「宏觀很安全」，強制買回來！(覆蓋掉上面的離場訊號)
+        df.loc[(df['holiday'].shift(1) > 2) & safe_zone, 'pos_day'] = 1.0
+
         return df
 
     def _calculate_metrics(self, returns: pd.Series) -> dict:
@@ -254,13 +268,33 @@ class TXAnalyzer:
 
     def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False):
         temp_df = self.df.copy()
+        
+        # 1. 先計算所有指標 (在時間序列還沒被打亂前)
+        # Macro
+        temp_df['yield_shock'] = temp_df['US_bond_5y'] - temp_df['US_bond_5y'].shift(20)
+        temp_df['yield_shock'] = temp_df['yield_shock'].shift(3) # Lag for safety
+        
+        # Technical
+        temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
+        temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
+        temp_df['divergence'] = temp_df['divergence'].shift(1) # Yesterday's divergence for today's trade
+
+        # Calendar
         temp_df.index = pd.to_datetime(temp_df.index)
         temp_df['prev_date'] = temp_df.index.to_series().shift(1)
         temp_df['gap'] = (temp_df.index.to_series() - temp_df['prev_date']).dt.days
+        
         if after_holiday:
+            # 想看週一 (Post-holiday)
+            # Day: 週一日盤 = Current (No shift)
+            # Night: 週一夜盤 = 記在週二 (Next Row) -> shift(-1)
             temp_df['daily_ret_a'] = temp_df['daily_ret_a'].shift(-1)
-        elif after_holiday is False:
+        else:
+            # 想看週五 (Pre-holiday)
+            # Day: 週五日盤 = 記在週五 (Prev Row) -> shift(1)
             temp_df['daily_ret'] = temp_df['daily_ret'].shift(1)
+            # Night: 週五夜盤 = 記在週一 (Current Row) -> No shift
+            pass
 
         temp_df = temp_df.sort_values(by='gap').reset_index(drop=True)
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
@@ -271,19 +305,29 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
 
         if sub_analysis:
+            # 2. 進行篩選
+            # 只看剛放完假的 (例如週一)
             temp_df = temp_df.loc[temp_df['gap'] > 2]
-            temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
-            temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
-            temp_df['divergence'] = temp_df['divergence'].shift(1)
+            
+            # 過濾掉宏觀高風險 (Yield Shock > 0.3)
+            # is_shock = temp_df['yield_shock'] > 0.3
+            # temp_df = temp_df.loc[~is_shock]
+            
+            # 確保有技術指標 (前面 shift 造成前幾筆是 NaN)
             temp_df = temp_df.dropna(subset=['divergence'])
-            temp_df = temp_df.sort_values(by='divergence').reset_index(drop=True)
+            
+            # 依技術面強弱排序，觀察績效
+            temp_df = temp_df.sort_values(by='yield_shock').reset_index(drop=True)
+            
+            # 重算累積報酬 (因為 filter 過了)
             temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
             temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
             temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
             temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
             temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
-            return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+            
+            return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='yield_shock', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
@@ -348,6 +392,34 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+
+    def indicator_weekday_stats(self):
+        """
+        統計並繪製每週各交易日 (Mon-Fri) 的平均報酬率
+        """
+        import plotly.express as px
+        
+        df = self.df.copy()
+        df['weekday'] = df.index.weekday
+        
+        # Group by weekday
+        weekday_stats = df.groupby('weekday')[['daily_ret', 'daily_ret_a']].mean()
+        
+        # Rename index for better readability
+        weekday_map = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
+        weekday_stats.index = weekday_stats.index.map(weekday_map)
+        
+        print("=== Weekday Average Returns ===")
+        display(weekday_stats)
+        
+        # Plot
+        fig = px.bar(
+            weekday_stats, 
+            barmode='group',
+            title='Average Return by Weekday',
+            labels={'value': 'Avg Return', 'index': 'Weekday', 'variable': 'Session'}
+        )
+        fig.show()
 
     def indicator_US_bond(self, indicator: str, sub_analysis: bool = False):
         import numpy as np
@@ -507,7 +579,7 @@ class TXAnalyzer:
             return val
 
         # Apply formatting
-        formatted_df = metrics_df.copy()
+        formatted_df = metrics_df.copy().astype(object)
         for idx in formatted_df.index:
             formatted_df.loc[idx] = formatted_df.loc[idx].apply(lambda x: format_metrics(x, idx))
 
