@@ -60,12 +60,13 @@ class TXAnalyzer:
 
         # --- 1. 定義輔助 Mask (條件) ---
         # A. 宏觀條件
-        severe_shock = df['yield_shock'] > 0.3    # 重大衝擊
+        severe_shock = df['yield_shock'] > 0.3  # 重大衝擊
         mild_shock = df['yield_shock'] > 0.15   # 輕微衝擊
-        safe_zone = df['yield_shock'] < 0.18   # 宏觀安全
+        safe_zone = df['yield_shock'] < 0.18    # 宏觀安全
 
+        skew_shape = df['SkewSlope_a'] < -0.065 # option 偏空
         # B. 技術條件
-        strong_tech = df['divergence'] > 0.004    # 強勢
+        strong_tech = df['divergence'] > 0.004  # 強勢
 
         # C. 節日條件 (Gap)
         # holiday 用 yield_shock 排序
@@ -398,6 +399,29 @@ class TXAnalyzer:
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
+    def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = ['day', 'night']):
+        df = self.df.copy()
+        if trading_session == 'day':
+            df = df.sort_values(by='SkewSlope_a').reset_index(drop=True)
+            df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+            df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+            df['cum_daily_ret'] = df['daily_ret'].cumsum()
+            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'])
+        elif trading_session == 'night':
+            df['SkewSlope'] = df['SkewSlope'].shift(1)
+            df = df.sort_values(by='SkewSlope').reset_index(drop=True)
+            df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
+            df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
+            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'])
+        
+        if sub_analysis:
+            df = df.sort_values(by='Foreign_Opt_Signal').reset_index(drop=True)
+            df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+            df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+            df['cum_daily_ret'] = df['daily_ret'].cumsum()
+            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal', sub_ly=['cum_daily_ret'])
+
     def indicator_margin_delta(self):
         temp_df = self.df.copy()
         temp_df['margin_delta'] = (temp_df['MarginPurchaseMoney']/temp_df['MarginPurchaseMoney'].shift(1)) - 1
@@ -478,32 +502,15 @@ class TXAnalyzer:
             'cash_crunch', 'near_inversion', 'near_yield_vol'
             ]
 
-        ffill_col = ['US_bond_5y', 'US_bond_3m']
+        ffill_col = ['US_bond_5y']
         for col in ffill_col:
             if temp_df[col].isna().sum() > 0:
                 temp_df[col] = temp_df[col].ffill()
 
         # 長債
         temp_df['yield_shock'] = temp_df['US_bond_5y'] - temp_df['US_bond_5y'].shift(20)
-        temp_df['30ma_5y'] = temp_df['US_bond_5y'].rolling(window=30).mean()
-        temp_df['yield_divergence'] = (temp_df['US_bond_5y'] / temp_df['30ma_5y']) - 1
-        temp_df['yield_spread'] = temp_df['US_bond_5y'] - temp_df['US_bond_3m']
-        temp_df['spread_delta'] = temp_df['yield_spread'].diff(15)
-        temp_df['yield_presure'] = np.where(
-            temp_df['yield_spread'] < 0,
-            temp_df['spread_delta'],
-            0
-        )
 
-        # 短債
-            ## 資金成本成長多少，越大資金越緊縮
-        temp_df['cash_crunch'] = temp_df['US_bond_3m'].diff(5)
-            ## 「現在」比「未來」更缺錢
-        temp_df['near_inversion'] = temp_df['US_bond_6m'] - temp_df['US_bond_3m']
-            ## 市場對資金水位感到恐慌
-        temp_df['near_yield_vol'] = temp_df['US_bond_3m'].rolling(10).std()
-
-        temp_df[ind_list] = temp_df[ind_list].shift(2)
+        temp_df['yield_shock'] = temp_df['yield_shock'].shift(3)
 
         temp_df['demean_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demean_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
@@ -654,7 +661,7 @@ class TXAnalyzer:
             else:
                 print("No risk events triggered.")
 
-        return plot.plot(df, ly=['cum_strat', 'cum_bnh'])
+        return plot.plot(df, ly=['cum_strat', 'cum_bnh'], ry='yield_shock', ry_dashed=False)
 
     def show_factor_distributions(self):
         """
