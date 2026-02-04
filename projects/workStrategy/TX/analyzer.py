@@ -32,13 +32,6 @@ class TXAnalyzer:
     def _calculate_factors(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to calculate all strategy factors."""
         # --- A. 宏觀債券 (Macro - The Risk Radar) ---
-        # 1. 估值殺手 (Valuation): 20天長債變動
-        df['yield_shock'] = df['US_bond_5y'] - df['US_bond_5y'].shift(20)
-
-        # 防未來數據 (Macro指標通常落後或當天晚上才看得到，保守 shift 2)
-        macro_cols = ['yield_shock']
-        df[macro_cols] = df[macro_cols].shift(3)
-
         # --- B. 日曆效應 (Calendar - The Time Decay) ---
         # 計算 Gap (T日 - T-1日的天數)
         df.index = pd.to_datetime(df.index)
@@ -48,54 +41,33 @@ class TXAnalyzer:
 
         # --- C. 技術乖離 (Technical - The Entry Trigger) ---
         # 15MA 乖離率
-        df['15_ma'] = df['Close'].rolling(window=15).mean()
-        df['divergence'] = (df['Close'] / df['15_ma']) - 1
-        df['divergence'] = df['divergence'].shift(1)
+        df['3_ma'] = df['Close_a'].rolling(window=3).mean()
+        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+
+        df['opt_pos'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal'].shift(1) + ['Foreign_Opt_Signal_a']
+        df['opt_pos'] = df['opt_pos'].shift(1)
         
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['pos_night'] = 1.0
+        df['pos_night'] = 0.0
         df['pos_day'] = 1.0
 
         # --- 1. 定義輔助 Mask (條件) ---
         # A. 宏觀條件
-        severe_shock = df['yield_shock'] > 0.3  # 重大衝擊
-        mild_shock = df['yield_shock'] > 0.15   # 輕微衝擊
-        safe_zone = df['yield_shock'] < 0.18    # 宏觀安全
-
-        skew_shape = df['SkewSlope_a'] < -0.065 # option 偏空
+        foreign_opt_short = df['Foreign_Opt_Signal'] < -0.0035 # option 偏空
+        
         # B. 技術條件
-        strong_tech = df['divergence'] > 0.004  # 強勢
+        strong_tech = (df['divergence'] > 0) & (df['divergence'] < 0.01)  # 強勢
+        weak_tech = (df['divergence'] > 0.012) & (df['divergence'] < 0)  # 弱勢
 
-        # C. 節日條件 (Gap)
-        # holiday 用 yield_shock 排序
-        is_abnormal = (df['yield_shock'] < -0.2) | (df['yield_shock'] > 0.35)
-
-        # --- 2. 執行風控層 (Layers) ---
-        
-        # Layer 2: 宏觀風控 (Macro)
-        df.loc[mild_shock, ['pos_night', 'pos_day']] = 0.0
-
-        # Layer 3: 節日風控 (Holiday)
-        # 3.1 放假前一天：
-        df.loc[(df['holiday'].shift(1) > 2) & is_abnormal, 'pos_night'] = 0.0
-        # 3.2 放假後第一天：
-        df.loc[(df['holiday'].shift(1) > 2) & ~safe_zone, 'pos_day'] = 0.0
-
-        # --- 3. 執行進場層 (Entries) ---
-
-        # Layer 4: 技術進場 (Technical)
-        # 4.1 夜盤進場 (無重大衝擊 + 技術強)
-        df.loc[~severe_shock & strong_tech, 'pos_night'] = 1.0
-        
-        # Layer 5: 特別例外 (Overrides)
-        # 5.1 日盤離場：原本乖離不夠要砍單...
-        df.loc[~strong_tech, 'pos_day'] = 0.0
-        
-        # 5.2 聰明接刀 (Smart Re-entry):
-        # 但如果是「剛收假」且「宏觀很安全」，強制買回來！(覆蓋掉上面的離場訊號)
-        df.loc[(df['holiday'].shift(1) > 2) & safe_zone, 'pos_day'] = 1.0
+        # --- 2. 執行層 (Layers) ---
+        # df.loc[foreign_opt_short, 'pos_day'] = 0.0
+        # df.loc[~foreign_opt_short, 'pos_day'] = 1.0
+        # df.loc[strong_tech, 'pos_day'] = 1.0
+        # df.loc[weak_tech, 'pos_day'] = 0.0
+        df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
+        df.loc[df['opt_pos'] < -0.012, 'pos_night'] = 1.0
 
         return df
 
@@ -414,13 +386,42 @@ class TXAnalyzer:
             df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'])
-        
-        if sub_analysis:
-            df = df.sort_values(by='Foreign_Opt_Signal').reset_index(drop=True)
+    
+    def indicator_opt_position(self, indicator: str = 'Foreign_Opt_Signal', trading_session: str = 'day' or 'night', sub_analysis: bool = False, time_series_analysis: bool = False):
+        # Foreign_Opt_Signal, Dealer_Opt_Signal
+        # signal 代表，每一塊錢中，有多少做多(> 0) / 做空(< 0)
+        df = self.df.copy()
+        if trading_session == 'day':
+            df = df.sort_values(by=f'{indicator}_a').reset_index(drop=True)
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal', sub_ly=['cum_daily_ret'])
+            
+            if sub_analysis:
+                df_l = df.loc[df[f'{indicator}_a'] < -0.0035]
+                df_r = df.loc[df[f'{indicator}_a'] > -0.0035]
+                for df in [df_l, df_r]:
+                    df['SkewSlope_a'] = df['SkewSlope_a'].shift(1)
+                    df = df.sort_values(by='SkewSlope_a').reset_index(drop=True)
+                    df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+                    df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+                    df['cum_daily_ret'] = df['daily_ret'].cumsum()
+                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'])
+            else:
+                return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'])
+
+        elif trading_session == 'night':
+            df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[indicator].shift(1)
+            df['pos_continue'] = df['pos_continue'].shift(1)
+            if time_series_analysis:
+                df['signal'] = df['pos_continue'] > 0.012
+                df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+                return plot.plot(df, ly=['cum_daily_ret_a'], ry='signal', ry_dashed=False)
+            df = df.sort_values(by='pos_continue').reset_index(drop=True)
+            df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
+            df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
+            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'])
 
     def indicator_margin_delta(self):
         temp_df = self.df.copy()
@@ -450,7 +451,7 @@ class TXAnalyzer:
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='foreign_inflow', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'])
 
-    def indicator_bull_or_bear(self):
+    def indicator_15ma_divergence(self):
         temp_df = self.df.copy()
         temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
         temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
@@ -465,6 +466,33 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+
+    def indicator_night_price(self):
+        df = self.df.copy()
+        df['3_ma'] = df['Close_a'].rolling(3).mean()
+        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+        df = df.dropna(subset=['divergence'])
+        df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+
+        df = df.sort_values(by='divergence').reset_index(drop=True)
+        df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+        return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+
+    def indicator_spread(self, window: int = 5):
+        df = self.df.copy()
+        df.dropna(subset=['spread_a'], inplace=True)
+        df['next_ret'] = (df['Close_a'].shift(-window) - df['Close_a']) / df['Close_a']
+        df['sum_spread'] = df['spread_a'].rolling(window=window).sum()
+        df['sum_spread'] = df['sum_spread'].shift(1)
+        # df.dropna(subset=['sum_spread'], inplace=True)
+        df.sort_values(by='sum_spread', ignore_index=True, inplace=True)
+        df['demeaned_daily_ret_a'] = df['next_ret'] - df['next_ret'].mean()
+        df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
+        df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+        df['cum_daily_ret_a'] = df['next_ret'].cumsum()
+        return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='sum_spread', sub_ly=['cum_daily_ret_a'])
 
     def indicator_weekday_stats(self):
         """
@@ -524,6 +552,36 @@ class TXAnalyzer:
             temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
             return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+
+    def indicator_structural_weakness(self):
+        """
+        分析「市場結構轉弱」(Structural Weakness) 對績效的影響
+        
+        指標定義：
+        1. 收盤位置 (CLV): (Close - Low) / (High - Low)
+           - CLV < 0.4 代表收盤無力 (收在下半部)
+        2. 反彈失敗 (Bounce Failure): 
+           - T日上漲 (Ret > 0)
+           - 但 T+1日收盤 < T-1日收盤 (漲勢曇花一現，馬上被吞噬)
+           
+        濾網條件 (Filter): 過去 5 天內
+        - CLV < 0.4 的天數 >= 3
+        - 下跌天數 (Ret < 0) >= 3
+        - 發生過反彈失敗 >= 1 (Optional)
+        
+        驗證：當濾網觸發 (Signal ON) 時，後續的績效表現是否顯著較差？
+        """
+        df = self.df.copy()
+        df['weakness'] = (df['Close_a'] < df['Close_a'].shift(2))
+        df['pos_night'] = np.where(
+            df['weakness'].shift(1),
+            0,
+            1
+        )
+        df['strat_ret'] = df['daily_ret_a'] * df['pos_night']
+        df['cum_strat_ret'] = df['strat_ret'].cumsum()
+        df['cum_bnh_ret'] = df['daily_ret_a'].cumsum()
+        return plot.plot(df, ly=['cum_strat_ret', 'cum_bnh_ret'])
 
     def check_risk_events(self, filter_tech_signal: bool = False) -> pd.DataFrame:
         """
@@ -587,7 +645,7 @@ class TXAnalyzer:
         res_df = res_df.sort_values(by='Date')
         return res_df
 
-    def backtest(self, risk_log: bool = False, point_version: bool = False):
+    def backtest(self, risk_log: bool = False, point_version: bool = False, indicator: str = 'Foreign_Opt_Signal'):
         """
         回測策略 (Backtest Strategy)
         """
@@ -661,11 +719,12 @@ class TXAnalyzer:
             else:
                 print("No risk events triggered.")
 
-        return plot.plot(df, ly=['cum_strat', 'cum_bnh'], ry='yield_shock', ry_dashed=False)
+        return plot.plot(df, ly=['cum_strat', 'cum_bnh'], ry_dashed=False)
 
-    def show_factor_distributions(self):
+    def show_factor_distributions(self, factors: list = None):
         """
         顯示策略使用之各項指標因子分佈情形 (Histograms & Statistics)
+        factors: 指定要分析的因子清單 (預設為常用因子)
         """
         from plotly.subplots import make_subplots
         
@@ -673,8 +732,9 @@ class TXAnalyzer:
         # 確保因子已計算
         df = self._calculate_factors(df)
         
-        # 定義主要因子 (對應 _apply_signals_logic 使用的)
-        factors = ['yield_shock', 'near_yield_vol', 'divergence', 'holiday']
+        # 定義主要因子 (若未指定 fetch default)
+        if factors is None:
+            factors = ['Foreign_Opt_Signal', 'skew_diff', 'divergence', 'holiday']
         
         # 移除沒有該 flag 的情形 (例如 holiday 需要計算)
         valid_factors = [f for f in factors if f in df.columns]
