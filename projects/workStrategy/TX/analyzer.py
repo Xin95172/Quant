@@ -44,13 +44,14 @@ class TXAnalyzer:
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
 
-        df['opt_pos'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal'].shift(1) + ['Foreign_Opt_Signal_a']
+        df['opt_pos'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal'].shift(1) + df['Foreign_Opt_Signal_a']
         df['opt_pos'] = df['opt_pos'].shift(1)
         
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['pos_night'] = 0.0
+        df = df.loc[df.index > '2020-04-30']
+        df['pos_night'] = 1.0
         df['pos_day'] = 1.0
 
         # --- 1. 定義輔助 Mask (條件) ---
@@ -62,10 +63,10 @@ class TXAnalyzer:
         weak_tech = (df['divergence'] > 0.012) & (df['divergence'] < 0)  # 弱勢
 
         # --- 2. 執行層 (Layers) ---
-        # df.loc[foreign_opt_short, 'pos_day'] = 0.0
-        # df.loc[~foreign_opt_short, 'pos_day'] = 1.0
-        # df.loc[strong_tech, 'pos_day'] = 1.0
-        # df.loc[weak_tech, 'pos_day'] = 0.0
+        df.loc[foreign_opt_short, 'pos_day'] = 0.0
+        df.loc[~foreign_opt_short, 'pos_day'] = 1.0
+        df.loc[strong_tech, 'pos_day'] = 1.0
+        df.loc[weak_tech, 'pos_day'] = 0.0
         df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
         df.loc[df['opt_pos'] < -0.012, 'pos_night'] = 1.0
 
@@ -401,12 +402,13 @@ class TXAnalyzer:
                 df_l = df.loc[df[f'{indicator}_a'] < -0.0035]
                 df_r = df.loc[df[f'{indicator}_a'] > -0.0035]
                 for df in [df_l, df_r]:
-                    df['SkewSlope_a'] = df['SkewSlope_a'].shift(1)
-                    df = df.sort_values(by='SkewSlope_a').reset_index(drop=True)
+                    df['3ma'] = df['Close_a'].rolling(window=3).mean()
+                    df['divergence'] = (df['Close_a'] / df['3ma'] - 1)
+                    df = df.sort_values(by='divergence').reset_index(drop=True)
                     df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
                     df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
                     df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'])
+                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
             else:
                 return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'])
 
@@ -467,12 +469,20 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
-    def indicator_night_price(self):
+    def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
         df['3_ma'] = df['Close_a'].rolling(3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
         df = df.dropna(subset=['divergence'])
         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        if sub_analysis:
+            df_l = df.loc[df['divergence'] < 0]
+            df_r = df.loc[df['divergence'] >= 0]
+            for df in [df_l, df_r]:
+                df = df.sort_values(by='Foreign_Opt_Signal').reset_index(drop=True)
+                df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+                df['cum_daily_ret'] = df['daily_ret'].cumsum()
+            return plot.plot(df_l, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal', sub_ly=['cum_daily_ret'])
 
         df = df.sort_values(by='divergence').reset_index(drop=True)
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
