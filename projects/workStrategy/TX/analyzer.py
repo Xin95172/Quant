@@ -44,31 +44,27 @@ class TXAnalyzer:
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
 
-        df['opt_pos'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal'].shift(1) + df['Foreign_Opt_Signal_a']
+        df['opt_pos'] = df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal_a'].shift(1) + df['Foreign_Opt_Signal']
         df['opt_pos'] = df['opt_pos'].shift(1)
         
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.loc[df.index > '2020-04-30']
-        df['pos_night'] = 1.0
-        df['pos_day'] = 1.0
+        # df = df.loc[df.index > '2024-07-09'].copy()
+        df = df.loc[df.index > '2021-10-12'].copy()
+        df['pos_night'] = 0.0
+        df['pos_day'] = 0.0
 
         # --- 1. 定義輔助 Mask (條件) ---
         # A. 宏觀條件
-        foreign_opt_short = df['Foreign_Opt_Signal'] < -0.0035 # option 偏空
-        
-        # B. 技術條件
-        strong_tech = (df['divergence'] > 0) & (df['divergence'] < 0.01)  # 強勢
-        weak_tech = (df['divergence'] > 0.012) & (df['divergence'] < 0)  # 弱勢
+        foreign_opt_short = df['Foreign_Opt_Signal_a'] < -0.0035 # option 偏空
 
         # --- 2. 執行層 (Layers) ---
-        df.loc[foreign_opt_short, 'pos_day'] = 0.0
-        df.loc[~foreign_opt_short, 'pos_day'] = 1.0
-        df.loc[strong_tech, 'pos_day'] = 1.0
-        df.loc[weak_tech, 'pos_day'] = 0.0
+        condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
+        df.loc[condition_day, 'pos_day'] = 1.0
+
         df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
-        df.loc[df['opt_pos'] < -0.012, 'pos_night'] = 1.0
+        df.loc[df['opt_pos'] < 0.012, 'pos_night'] = 1.0
 
         return df
 
@@ -291,16 +287,6 @@ class TXAnalyzer:
 
     def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False):
         temp_df = self.df.copy()
-        
-        # 1. 先計算所有指標 (在時間序列還沒被打亂前)
-        # Macro
-        temp_df['yield_shock'] = temp_df['US_bond_5y'] - temp_df['US_bond_5y'].shift(20)
-        temp_df['yield_shock'] = temp_df['yield_shock'].shift(3) # Lag for safety
-        
-        # Technical
-        temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
-        temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
-        temp_df['divergence'] = temp_df['divergence'].shift(1) # Yesterday's divergence for today's trade
 
         # Calendar
         temp_df.index = pd.to_datetime(temp_df.index)
@@ -328,29 +314,25 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
 
         if sub_analysis:
-            # 2. 進行篩選
-            # 只看剛放完假的 (例如週一)
-            temp_df = temp_df.loc[temp_df['gap'] > 2]
+            temp_df['pos_day'] = 0
+            df = temp_df.loc[temp_df['gap'] > 2].copy()
+            df['3_ma'] = df['Close_a'].rolling(3).mean()
+            df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+            foreign_opt_short = df['Foreign_Opt_Signal'] < -0.0035 # option 偏空
+            condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
+            df.loc[condition_day, 'pos_day'] = 1.0
             
-            # 過濾掉宏觀高風險 (Yield Shock > 0.3)
-            # is_shock = temp_df['yield_shock'] > 0.3
-            # temp_df = temp_df.loc[~is_shock]
-            
-            # 確保有技術指標 (前面 shift 造成前幾筆是 NaN)
-            temp_df = temp_df.dropna(subset=['divergence'])
-            
-            # 依技術面強弱排序，觀察績效
-            temp_df = temp_df.sort_values(by='yield_shock').reset_index(drop=True)
+            df = df.sort_values(by='pos_day').reset_index(drop=True)
             
             # 重算累積報酬 (因為 filter 過了)
-            temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
-            temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
-            temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
-            temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
-            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
-            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+            df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
+            df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+            df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
+            df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+            df['cum_daily_ret'] = df['daily_ret'].cumsum()
             
-            return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='yield_shock', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='pos_day', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
 
@@ -474,16 +456,17 @@ class TXAnalyzer:
         df['3_ma'] = df['Close_a'].rolling(3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
         df = df.dropna(subset=['divergence'])
-        df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
         if sub_analysis:
             df_l = df.loc[df['divergence'] < 0]
             df_r = df.loc[df['divergence'] >= 0]
             for df in [df_l, df_r]:
-                df = df.sort_values(by='Foreign_Opt_Signal').reset_index(drop=True)
+                df = df.sort_values(by='Foreign_Opt_Signal_a').reset_index(drop=True)
+                df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
                 df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
                 df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            return plot.plot(df_l, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal', sub_ly=['cum_daily_ret'])
-
+                plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
+            return
+        df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
         df = df.sort_values(by='divergence').reset_index(drop=True)
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
