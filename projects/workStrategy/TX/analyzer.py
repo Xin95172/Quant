@@ -62,6 +62,7 @@ class TXAnalyzer:
         # --- 2. 執行層 (Layers) ---
         condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
         df.loc[condition_day, 'pos_day'] = 1.0
+        df.loc[foreign_opt_short, 'pos_day'] = -1.0
 
         df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
         df.loc[df['opt_pos'] < 0.012, 'pos_night'] = 1.0
