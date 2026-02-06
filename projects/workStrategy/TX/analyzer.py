@@ -396,7 +396,7 @@ class TXAnalyzer:
                 return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'])
 
         elif trading_session == 'night':
-            df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[indicator].shift(1)
+            df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[f'{indicator}'].shift(1)
             df['pos_continue'] = df['pos_continue'].shift(1)
             if time_series_analysis:
                 df['signal'] = df['pos_continue'] > 0.012
