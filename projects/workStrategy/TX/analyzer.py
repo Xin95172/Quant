@@ -51,7 +51,7 @@ class TXAnalyzer:
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
         # df = df.loc[df.index > '2024-07-09'].copy()
-        df = df.loc[df.index > '2021-10-12'].copy()
+        # df = df.loc[df.index > '2021-10-12'].copy()
         df['pos_night'] = 0.0
         df['pos_day'] = 0.0
 
@@ -653,10 +653,12 @@ class TXAnalyzer:
 
         # 3. 計算回測結果 (Backtest PnL)
         if point_version:
+            df['daily_pnl_a'] = df['Open'] - df['Open_a']
             df['strat_ret'] = (df['daily_pnl_a'] * df['pos_night']) + (df['daily_pnl'] * df['pos_day'])
             df['benchmark_ret'] = (df['daily_pnl_a'] + df['daily_pnl'])
             y_label = "Points"
         else:
+            df['daily_ret_a'] = (df['Open'] / df['Open_a']) - 1
             df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
             df['benchmark_ret'] = (df['daily_ret_a'] + df['daily_ret'])
             y_label = "Returns (%)"
