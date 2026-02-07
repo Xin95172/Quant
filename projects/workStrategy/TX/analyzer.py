@@ -408,6 +408,11 @@ class TXAnalyzer:
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'])
 
+    def check_volatility(self, window: int = 20):
+        df = self.df.copy()
+        df['volatility'] = df['daily_ret_a'].rolling(window=window).std()
+        
+
     def indicator_margin_delta(self):
         temp_df = self.df.copy()
         temp_df['margin_delta'] = (temp_df['MarginPurchaseMoney']/temp_df['MarginPurchaseMoney'].shift(1)) - 1
