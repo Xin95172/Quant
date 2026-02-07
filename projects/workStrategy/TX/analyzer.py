@@ -409,8 +409,22 @@ class TXAnalyzer:
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'])
 
     def check_volatility(self, window: int = 20):
+        """
+        檢視訊號前 window 天的波動度分佈（PDF）。
+        trading_session: 'night' 用 daily_ret_a；'day' 用 daily_ret。
+        """
         df = self.df.copy()
-        df['volatility'] = df['daily_ret_a'].rolling(window=window).std()
+        df.dropna(subset=['pos_continue'], inplace=True)
+
+        ret_col = 'daily_ret_a'
+        signal_col = 'pos_continue'
+
+        df['volatility'] = df[ret_col].rolling(window=window).std().shift(1)  # 用訊號前的 window
+        signals = df.loc[df[signal_col].notna() & (df[signal_col] != 0), 'volatility'].dropna()
+        if signals.empty:
+            print("[warn] no signal vols to plot")
+            return None
+        return plot.plot_pdf(signals, col=signals.name, title=f"signal vol (prev {window}d)")
         
 
     def indicator_margin_delta(self):
