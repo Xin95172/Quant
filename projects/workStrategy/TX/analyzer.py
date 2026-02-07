@@ -50,7 +50,7 @@ class TXAnalyzer:
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        # df = df.loc[df.index > '2024-07-09'].copy()
+        df = df.loc[df.index > '2024-07-09'].copy()
         # df = df.loc[df.index > '2021-10-12'].copy()
         df['pos_night'] = 0.0
         df['pos_day'] = 0.0

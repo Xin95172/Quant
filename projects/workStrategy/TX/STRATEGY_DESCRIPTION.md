@@ -9,9 +9,11 @@
 
 ## 指標計算
 - `3ma`：`Close_a` 的 3 日移動平均。
-- `divergence`：`Close_a / 3ma - 1`，衡量現價相對均線的乖離。
+- `divergence`：`Close_a / 3ma - 1`，衡量現價相對均線的乖離，>0 表示價位高於短均線、<0 表示偏弱。
+- `foreign_opt_pos_a`：外資夜盤選擇權淨額（多 CALL - 空 CALL - 多 PUT + 空 PUT）除以夜盤總成交金額，反映夜盤外資多空傾向，介於 -1 ~ 1。
+- `foreign_opt_pos`：同上，但使用日盤成交金額。
 - `opt_pos_continue`：外資選擇權部位的延續性指標  
-  `opt_pos_continue = foreign_opt_pos_a + foreign_opt_pos_a.shift(1) + foreign_opt_pos`，再在夜盤信號應用處 shift(1)，代表用昨日計算值決定今日夜盤。
+  `opt_pos_continue = foreign_opt_pos_a + foreign_opt_pos_a.shift(1) + foreign_opt_pos`，再在夜盤信號應用處 shift(1)，代表用「昨夜＋前夜＋當日日盤」的總和，隔一日後決定夜盤方向。
 
 ## 進出場邏輯
 ### 夜盤倉位 `pos_night`（訊號生效延後一天）
