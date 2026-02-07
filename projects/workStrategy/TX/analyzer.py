@@ -416,6 +416,9 @@ class TXAnalyzer:
         df = self.df.copy()
         df.dropna(subset=['pos_continue'], inplace=True)
 
+        df['pos_continue'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal'].shift(1)
+        df['pos_continue'] = df['pos_continue'].shift(1)
+        
         ret_col = 'daily_ret_a'
         signal_col = 'pos_continue'
 
