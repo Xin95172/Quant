@@ -410,25 +410,149 @@ class TXAnalyzer:
 
     def check_volatility(self, window: int = 20):
         """
-        檢視訊號前 window 天的波動度分佈（PDF）。
-        trading_session: 'night' 用 daily_ret_a；'day' 用 daily_ret。
+        事件變數 + 事件前 window 天波動度分佈（PDF）
+        pos_continue_t = Foreign_Opt_Signal_t + Foreign_Opt_Signal_a_t + Foreign_Opt_Signal_{t-1}
+        sig_lag_t      = pos_continue_{t-1}
+        event_t        = (sig_lag_t >= 0.012)
         """
         df = self.df.copy()
-
-        df['pos_continue'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal'].shift(1)
-        df['pos_continue'] = df['pos_continue'].shift(1)
-        
         ret_col = 'daily_ret_a'
-        signal_col = 'pos_continue'
 
-        df.reset_index(drop=False, inplace=True)
-        df['volatility'] = df[ret_col].rolling(window=window).std().shift(1)  # 用訊號前的 window
-        signals = df.loc[df[signal_col].notna() & (df[signal_col] != 0), 'volatility'].dropna()
-        if signals.empty:
-            print("[warn] no signal vols to plot")
+        # 訊號與事件
+        df['pos_continue'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal'].shift(1)
+        df['sig_lag'] = df['pos_continue'].shift(1)
+        th = 0.012
+        df['event'] = (df['sig_lag'] >= th)
+
+        # 波動：事件日前 window 天（不偷看）
+        df['vol'] = df[ret_col].rolling(window).std().shift(1)
+
+        # 事件統計（頻率與 run-length）
+        event_rate = df['event'].mean()
+        runs = (df['event'] != df['event'].shift()).cumsum()
+        run_lengths = df.groupby(runs)['event'].agg(['first', 'size'])
+        event_runs = run_lengths[run_lengths['first'] == True]['size']
+        avg_run = event_runs.mean() if not event_runs.empty else 0
+        max_run = event_runs.max() if not event_runs.empty else 0
+        first_20 = df.index[df['event']].to_series().head(20)
+        print(f"[event] rate: {event_rate:.4f}, avg_run: {avg_run}, max_run: {max_run}")
+        if not first_20.empty:
+            print("[event] first 20 dates:")
+            print(first_20)
+
+        # Sanity check：確認 lag 與報酬無前視
+        sample = df[['Foreign_Opt_Signal', 'Foreign_Opt_Signal_a', 'pos_continue', 'sig_lag', 'event', ret_col]].head(5)
+        print("[sanity] sample (check shifts):")
+        print(sample)
+
+        sig_vol = df.loc[df['event'] == True, 'vol'].dropna()
+        nonsig_vol = df.loc[df['event'] == False, 'vol'].dropna()
+
+        if sig_vol.empty or nonsig_vol.empty:
+            print("[warn] empty group")
             return None
-        return plot.plot_pdf(signals, col=signals.name, title=f"signal vol (prev {window}d)")
-        
+
+        # PDF
+        plot.plot_pdf(sig_vol.to_frame('vol'), col="vol", title=f"event vol (prev {window}d)")
+        plot.plot_pdf(nonsig_vol.to_frame('vol'), col="vol", title=f"non-event vol (prev {window}d)")
+
+        # 上漲/下跌機率
+        res_rows = []
+        for label, mask in [('event', df['event'] == True), ('non_event', df['event'] == False)]:
+            sub = df.loc[mask, [ret_col]].dropna()
+            if sub.empty:
+                p_pos = p_neg = np.nan
+                n = 0
+                mean_neg = mean_pos = mean_abs_neg = mean_abs_pos = np.nan
+            else:
+                n = len(sub)
+                p_pos = (sub[ret_col] > 0).mean()
+                p_neg = (sub[ret_col] < 0).mean()
+                neg = sub.loc[sub[ret_col] < 0, ret_col]
+                pos = sub.loc[sub[ret_col] > 0, ret_col]
+                mean_neg = neg.mean() if not neg.empty else np.nan
+                mean_pos = pos.mean() if not pos.empty else np.nan
+                mean_abs_neg = neg.abs().mean() if not neg.empty else np.nan
+                mean_abs_pos = pos.abs().mean() if not pos.empty else np.nan
+            res_rows.append({
+                'group': label,
+                'p_pos': p_pos, 'p_neg': p_neg, 'n': n,
+                'mean_neg': mean_neg, 'mean_pos': mean_pos,
+                'mean_abs_neg': mean_abs_neg, 'mean_abs_pos': mean_abs_pos,
+            })
+        freq_df = pd.DataFrame(res_rows)
+        print("=== Up/Down Probability & Magnitude by Event Group ===")
+        print(freq_df)
+
+        # 左尾風險：多個門檻的 tail probability
+        thresholds = [0.005, 0.01, 0.015]  # 0.5%, 1%, 1.5%（可依需要調整）
+        tail_rows = []
+        for x in thresholds:
+            p_evt = (df.loc[df['event'] == True, ret_col] <= -x).mean()
+            p_none = (df.loc[df['event'] == False, ret_col] <= -x).mean()
+            tail_rows.append({
+                'threshold_x': x,
+                'p_event': p_evt,
+                'p_nonevent': p_none,
+                'diff': p_evt - p_none,
+                'ratio': (p_evt / p_none) if p_none not in [0, np.nan] else np.nan,
+            })
+        tail_df = pd.DataFrame(tail_rows)
+        print("=== Tail Probability (ret <= -x) by Event Group ===")
+        print(tail_df)
+
+        # 分位數比較（左尾更穩健）
+        quants = [0.01, 0.05, 0.10]
+        q_rows = []
+        for qv in quants:
+            evt_val = df.loc[df['event'] == True, ret_col].quantile(qv)
+            none_val = df.loc[df['event'] == False, ret_col].quantile(qv)
+            q_rows.append({
+                'quantile': qv,
+                'event_value': evt_val,
+                'non_event_value': none_val,
+                'diff': evt_val - none_val,
+            })
+        q_df = pd.DataFrame(q_rows)
+        print("=== Quantile Comparison (event vs non_event) ===")
+        print(q_df)
+
+        # 連跌（二連跌機率），條件用 event_t
+        res_pairs = []
+        evt_mask = df['event'] == True
+        none_mask = df['event'] == False
+        for label, mask in [('event', evt_mask), ('non_event', none_mask)]:
+            sub = df.loc[mask, [ret_col]].dropna()
+            # 將當期與下一期配對
+            pair_down = (sub[ret_col] < 0) & (sub[ret_col].shift(-1) < 0)
+            n_pairs = pair_down.notna().sum() - 1  # 有效配對數
+            p_2down = pair_down.mean()
+            res_pairs.append({'group': label, 'p_2down': p_2down, 'n_pairs': n_pairs})
+        pairs_df = pd.DataFrame(res_pairs)
+        print("=== Two-day Down Probability (condition on event_t) ===")
+        print(pairs_df)
+
+        # conditional downside/upside vol within rolling window
+        res_cond = []
+        for label, mask in [('event', df['event'] == True), ('non_event', df['event'] == False)]:
+            sub = df.loc[mask, ret_col]
+            if sub.empty:
+                res_cond.append({'group': label, 'downside_std': np.nan, 'upside_std': np.nan, 'ratio': np.nan})
+                continue
+            down_series = sub.rolling(window).apply(lambda x: x[x < 0].std() if (x < 0).any() else np.nan, raw=False)
+            up_series = sub.rolling(window).apply(lambda x: x[x > 0].std() if (x > 0).any() else np.nan, raw=False)
+            down_mean = down_series.dropna().mean()
+            up_mean = up_series.dropna().mean()
+            ratio = (down_mean / up_mean) if up_mean not in [0, np.nan] else np.nan
+            res_cond.append({
+                'group': label,
+                'downside_std': down_mean,
+                'upside_std': up_mean,
+                'ratio': ratio,
+            })
+        cond_df = pd.DataFrame(res_cond)
+        print("=== Conditional Downside/Upstate Vol (rolling window) ===")
+        print(cond_df)
 
     def indicator_margin_delta(self):
         temp_df = self.df.copy()
