@@ -33,32 +33,29 @@ class TXAnalyzer:
         """Helper to calculate all strategy factors."""
         # --- A. SOX ---
         df['SOX'] = (df['SOX_close'] / df['SOX_open']) - 1
-        df['SOX'] = df['SOX'].shift(1)  # 對齊時間
         df['SOX_ind'] = df['SOX'].rolling(window=3).mean()  # 3ma
         df['SOX_ind'] = df['SOX_ind'].shift(2)
+        df['SOX_ind'] = df['SOX_ind'].ffill()
 
         # --- 15 ma divergence ---
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
-
-        # --- Option Position (pos_continue) ---
-        df['opt_pos'] = df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal_a'].shift(1) + df['Foreign_Opt_Signal']
-        df['opt_pos'] = df['opt_pos'].shift(1)
         
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
         # df = df.loc[df.index > '2024-07-09'].copy()
         df = df.loc[df.index > '2021-10-12'].copy()
+        df.dropna(subset='futures_id', inplace=True)
         df['pos_night'] = 0.0
         df['pos_day'] = 0.0
 
         # === strat 1 ===
-        # # --- condition ---
+        #   # --- condition ---
         # foreign_opt_short = df['Foreign_Opt_Signal_a'] < -0.0035 # option 偏空
         # condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
 
-        # # --- execute Layers ---
+        #   # --- execute Layers ---
         # df.loc[condition_day, 'pos_day'] = 1.0
         # df.loc[foreign_opt_short, 'pos_day'] = -1.0
 
@@ -66,7 +63,7 @@ class TXAnalyzer:
         # df.loc[df['opt_pos'] < 0.012, 'pos_night'] = 1.0
 
         # === strat 2 ===
-        # --- condition ---
+            # --- condition ---
         sox_split = df['SOX_ind'] < 0.0025
         foreign_opt_l = df['Foreign_Opt_Signal_a'] < -0.002
         foreign_opt_r = df['Foreign_Opt_Signal_a'] < -0.0035
@@ -74,10 +71,14 @@ class TXAnalyzer:
         divergence_rl = df['divergence'] < -0.01
         divergence_rr = df['divergence'] < 0.02
         
-        # --- execute Layers ---
+            # --- execute Layers ---
+        # df['Foreign_Opt_Signal_a'] = df['Foreign_Opt_Signal_a'].ffill()
+        # df['divergence'] = df['divergence'].ffill()
         df.loc[sox_split & (foreign_opt_l | ~foreign_opt_l & divergence_lr), 'pos_day'] = -1.0
+        df.loc[sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = -1.0
         df.loc[sox_split & (~foreign_opt_l & ~divergence_lr), 'pos_day'] = 1.0
         df.loc[~sox_split & ((foreign_opt_r & divergence_rl) | (~foreign_opt_r & divergence_rr)), 'pos_day'] = 1.0
+        df.loc[~sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = 1.0
 
         return df
 
@@ -801,9 +802,11 @@ class TXAnalyzer:
                 return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
         
         if sub_analysis:
-            df_l = df.loc[df['ind'] < 0.0025].copy()
+            # df_l = df.loc[df['ind'] < 0.0025].copy()
+            df_l = df.loc[df['ind'] < 0.0095].copy()
             df_ll = df_l.loc[df['Foreign_Opt_Signal_a'] < -0.002].copy()
             df_lr = df_l.loc[df['Foreign_Opt_Signal_a'] >= -0.002].copy()
+            df_r = df.loc[df['ind'] >= 0.0025].copy()
             df_r = df.loc[df['ind'] >= 0.0025].copy()
             df_rl = df_r.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
             df_rr = df_r.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
@@ -953,6 +956,7 @@ class TXAnalyzer:
             df['benchmark_ret'] = df['daily_ret']
             y_label = "Returns (%)"
 
+        df.to_csv('test.csv', index=True)
         df['cum_strat'] = df['strat_ret'].cumsum()
         df['cum_bnh'] = df['benchmark_ret'].cumsum()
 
