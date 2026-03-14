@@ -32,15 +32,30 @@ class TXAnalyzer:
     def _calculate_factors(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to calculate all strategy factors."""
         # --- A. SOX ---
-        df['SOX'] = (df['SOX_close'] / df['SOX_open']) - 1
-        df['SOX_ind'] = df['SOX'].rolling(window=3).mean()  # 3ma
-        df['SOX_ind'] = df['SOX_ind'].shift(2)
+            # strat 2
+        # df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
+        # df['SOX_ind'] = df['SOX'].rolling(window=3).mean()  # 3ma
+        # df['SOX_ind'] = df['SOX_ind'].shift(2)
+        # df['SOX_ind'] = df['SOX_ind'].ffill()
+
+            # strat 3
+        df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
+        df['SOX_ind'] = df['SOX_ind'].shift(1)
         df['SOX_ind'] = df['SOX_ind'].ffill()
 
-        # --- 15 ma divergence ---
+        # --- B. MOVE ---
+            # strat 3
+        df['MOVE_ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
+        df['MOVE_vol'] = (df['MOVE_high'] / df['MOVE_low']) - 1
+        df['MOVE_vol'] = df['MOVE_vol'].shift(1)
+
+        # --- C. 15 ma divergence ---
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
-        
+
+        # --- D. gap ---
+        df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
+
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -62,23 +77,46 @@ class TXAnalyzer:
         # df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
         # df.loc[df['opt_pos'] < 0.012, 'pos_night'] = 1.0
 
-        # === strat 2 ===
-            # --- condition ---
-        sox_split = df['SOX_ind'] < 0.0025
-        foreign_opt_l = df['Foreign_Opt_Signal_a'] < -0.002
-        foreign_opt_r = df['Foreign_Opt_Signal_a'] < -0.0035
-        divergence_lr = df['divergence'] < -0.001
-        divergence_rl = df['divergence'] < -0.01
-        divergence_rr = df['divergence'] < 0.02
+        # # === strat 2 ===
+        # #     --- condition ---
+        # sox_split = df['SOX_ind'] < 0.0025
+        # foreign_opt_l = df['Foreign_Opt_Signal_a'] < -0.002
+        # foreign_opt_r = df['Foreign_Opt_Signal_a'] < -0.0035
+        # divergence_lr = df['divergence'] < -0.001
+        # divergence_rl = df['divergence'] < -0.01
+        # divergence_rr = df['divergence'] < 0.02
         
-            # --- execute Layers ---
+        #     # --- execute Layers ---
         # df['Foreign_Opt_Signal_a'] = df['Foreign_Opt_Signal_a'].ffill()
         # df['divergence'] = df['divergence'].ffill()
-        df.loc[sox_split & (foreign_opt_l | ~foreign_opt_l & divergence_lr), 'pos_day'] = -1.0
-        df.loc[sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = -1.0
-        df.loc[sox_split & (~foreign_opt_l & ~divergence_lr), 'pos_day'] = 1.0
-        df.loc[~sox_split & ((foreign_opt_r & divergence_rl) | (~foreign_opt_r & divergence_rr)), 'pos_day'] = 1.0
-        df.loc[~sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = 1.0
+        # df.loc[sox_split & (foreign_opt_l | ~foreign_opt_l & divergence_lr), 'pos_day'] = -1.0
+        # df.loc[sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = -1.0
+        # df.loc[sox_split & (~foreign_opt_l & ~divergence_lr), 'pos_day'] = 1.0
+        # df.loc[~sox_split & ((foreign_opt_r & divergence_rl) | (~foreign_opt_r & divergence_rr)), 'pos_day'] = 1.0
+        # df.loc[~sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = 1.0
+
+        # # === strat 3(日盤) ===
+        #     # --- condition ---
+        # move_split = df['MOVE_ind'] < 0.0001
+        # sox_split = df['SOX_ind'] < 0.0075
+        # gap_s_l = df['gap'] < 0.001
+        # foreign_split = df['Foreign_Opt_Signal_a'] < -0.0035
+        # divergence_f_r = df['divergence'] < -0.0015
+
+        #     # --- execute Layers ---
+        # df.loc[move_split & sox_split & ~gap_s_l, 'pos_day'] = 1.0
+        # df.loc[move_split & ~sox_split, 'pos_day'] = 1.0
+        # df.loc[~move_split & foreign_split, 'pos_day'] = -1.0
+        # df.loc[~move_split & ~foreign_split & ~divergence_f_r, 'pos_day'] = 1.0
+        
+        # === strat 4(夜盤) ===
+            # --- condition ---
+        df['MOVE_ind'] = df['MOVE_ind'].shift(1)
+        move_vol_split = df['MOVE_vol'] < 0.0145
+        move_ind_split = df['MOVE_ind'] < 0
+
+            # --- execute layers ---
+        df.loc[~move_vol_split, 'pos_night'] = 1.0
 
         return df
 
@@ -402,11 +440,17 @@ class TXAnalyzer:
                 for df in [df_l, df_r]:
                     df['3ma'] = df['Close_a'].rolling(window=3).mean()
                     df['divergence'] = (df['Close_a'] / df['3ma'] - 1)
-                    df = df.sort_values(by='divergence').reset_index(drop=True)
+
+                    df['MOVE_ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
+                    
+                    df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
+                    df['SOX_ind'] = df['SOX_ind'].shift(1)
+
+                    df = df.sort_values(by='MOVE_ind').reset_index(drop=True)
                     df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
                     df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
                     df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'])
             else:
                 return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'])
 
@@ -763,28 +807,142 @@ class TXAnalyzer:
         elif trading_session == 'day':
             return plot.plot(df, ly=['cum_demean_daily_ret'], ry='delta_fear_greed', sub_ly=['cum_daily_ret'])
 
-    def indicator_move(self):
+    def indicator_move(self, trading_session: str, sub_analysis: bool = False):
         df = self.df.copy()
-        df.dropna(subset=['daily_ret_a'], inplace=True)
-        df['ind'] = (df['MOVE_high'] /df['MOVE_low']) - 1
-        df['ind'] = df['ind'].shift(1)
+        # ====== 計算指標 ======
+        df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
+        df['SOX_ind'] = df['SOX_ind'].shift(1)
+
+        df['3_ma'] = df['Close_a'].rolling(window=3).mean()
+        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+
+        df['ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
+        df['MOVE_ma'] = 1
+        df['MOVE_divergence'] = (df['MOVE_close'] / df['MOVE_ma']) - 1
+
+        df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
+
         df['demean_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-        df = df.sort_values(by='ind').reset_index(drop=True)
-        df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
-        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-        df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-        df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='ind', sub_ly=['cum_daily_ret_a'])
+
+        if trading_session == 'night':
+            df['MOVE_vol'] = (df['MOVE_high'] / df['MOVE_low']) - 1
+            df['MOVE_vol'] = df['MOVE_vol'].shift(1)
+            df['MOVE_divergence'] = df['MOVE_divergence'].shift(1)
+
+            df['ind'] = df['ind'].shift(1)
+            df = df.sort_values(by='MOVE_vol').reset_index(drop=True)
+            df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
+            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+            plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='MOVE_vol', sub_ly=['cum_daily_ret_a'])
+
+            print("==================\n==================")
+
+            if sub_analysis:
+                df_l, df_r = df.loc[df['MOVE_vol'] < 0.0145], df.loc[df['MOVE_vol'] >= 0.0145]
+
+                lt = [df_l, df_r]
+
+                for idx, df in enumerate(lt):
+                    if idx == 0:
+                        df = df.sort_values(by='ind').reset_index(drop=True)
+                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+
+                        sub_df_ll, sub_df_lr = df.loc[df['MOVE_divergence'] < 0.0075].copy(), df.loc[df['MOVE_divergence'] >= 0.0075].copy()
+                        # sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < -0.0043].copy(), df.loc[df['SOX_ind'] >= -0.0043].copy()
+
+                        # for sub_df in [sub_df_ll, sub_df_lr]:
+                        #     sub_df = sub_df.sort_values(by='gap')
+                        #     sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
+                        #     sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
+                        #     sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
+                        #     plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
+
+                    elif idx == 1:
+                        df = df.sort_values(by='ind').reset_index(drop=True)
+                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+
+                        sub_df_rl, sub_df_rr = df.loc[df['MOVE_divergence'] < -0.0035].copy(), df.loc[df['MOVE_divergence'] >= -0.0035].copy()
+
+                        # for sub_df in [sub_df_rl, sub_df_rr]:
+                        #     sub_df = sub_df.sort_values(by='divergence')
+                        #     sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
+                        #     sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
+                        #     sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
+                        #     plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+
+                    print("----------------------------")
+
+        elif trading_session == 'day':
+            df = df.sort_values(by='ind').reset_index(drop=True)
+            df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+            df['cum_daily_ret'] = df['daily_ret'].cumsum()
+            plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+
+            print("==================\n==================")
+
+            if sub_analysis:
+                df_l = df.loc[df['ind'] < 0.0001].copy()
+                df_r = df.loc[df['ind'] >= 0.0001].copy()
+
+                lt = [df_l, df_r]
+
+                for idx, df in enumerate(lt):
+                    if idx == 0:
+                        df = df.sort_values(by='SOX_ind')
+                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='SOX_ind', sub_ly=['cum_daily_ret'])
+
+                        sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < 0.0075].copy(), df.loc[df['SOX_ind'] >= 0.0075].copy()
+                        # sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < -0.0043].copy(), df.loc[df['SOX_ind'] >= -0.0043].copy()
+
+                        for sub_df in [sub_df_ll, sub_df_lr]:
+                            sub_df = sub_df.sort_values(by='gap')
+                            sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
+                            sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
+                            sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
+                            plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
+
+                    elif idx == 1:
+                        df = df.sort_values(by='Foreign_Opt_Signal_a')
+                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
+
+                        sub_df_rl, sub_df_rr = df.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy(), df.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
+
+                        for sub_df in [sub_df_rl, sub_df_rr]:
+                            sub_df = sub_df.sort_values(by='divergence')
+                            sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
+                            sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
+                            sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
+                            plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+
+                    print("----------------------------")
 
     def indicator_sox(self, trading_session: str, sub_analysis: bool = False):
         df = self.df.copy()
-        df.dropna(subset=['daily_ret_a'], inplace=True)
+
         df['ind'] = (df['SOX_close'] / df['SOX_open']) - 1
-        df['ind'] = df['ind'].rolling(window=3).mean()
-        df['ind'] = df['ind'].shift(2)
+        # df['ind'] = df['ind'].rolling(window=3).mean()
+        df['ind'] = df['ind'].shift(1)
+        # df['ind'] = (df['SOX_high'] - df['SOX_low']) / df['SOX_close'].shift(1)
+
+        df['gap'] = (df['Open'] / df['Close'].shift(1)) - 1
+
         df['demean_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        df.to_csv('test_sox.csv', index=True)
+        # df.dropna(subset=['ind'], inplace=True)
         if not sub_analysis:
             if trading_session == 'night':
                 df['ind'] = df['ind'].shift(1)
@@ -801,67 +959,133 @@ class TXAnalyzer:
                 print(f"SOX ind threshold=0.0025\nmean_l={mean_l:.6f} | mean_r={mean_r:.6f}")
                 return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
         
+        # # sub 1：SOX 優先
+        # if sub_analysis:
+        #     # df_l = df.loc[df['ind'] < 0.0025].copy()
+        #     df_l = df.loc[df['ind'] < 0.0095].copy()
+        #     df_ll = df_l.loc[df['Foreign_Opt_Signal_a'] < -0.002].copy()
+        #     df_lr = df_l.loc[df['Foreign_Opt_Signal_a'] >= -0.002].copy()
+        #     df_r = df.loc[df['ind'] >= 0.0025].copy()
+        #     df_r = df.loc[df['ind'] >= 0.0025].copy()
+        #     df_rl = df_r.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
+        #     df_rr = df_r.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
+        #     i = 0
+        #     for df in [df_l, df_r]:
+        #         df = df.sort_values(by='Foreign_Opt_Signal_a').reset_index(drop=True)
+        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
+        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
+
+        #         if i == 0:
+        #             print("--- Sub-analysis: SOX ind < 0.0025 (Left) ---")
+        #             lt = [df_ll, df_lr]
+        #             threshold_l = -999
+        #             threshold_r = -0.001
+        #         elif i == 1:
+        #             print("--- Sub-analysis: SOX ind >= 0.0025 (Right) ---")
+        #             lt = [df_rl, df_rr]
+        #             threshold_l = -0.01
+        #             threshold_r = 0.02
+
+        #         for idx, sub_df in enumerate(lt):
+        #             sub_df['3_ma'] = sub_df['Close_a'].rolling(window=3).mean()
+        #             sub_df['divergence'] = (sub_df['Close_a'] / sub_df['3_ma']) - 1
+
+        #             sub_df = sub_df.sort_values(by='divergence').reset_index(drop=True)
+        #             sub_df['demeaned_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
+        #             sub_df['cum_demeaned_daily_ret'] = sub_df['demeaned_daily_ret'].cumsum()
+        #             sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
+
+        #             if idx == 0:
+        #                 left_mask = sub_df['divergence'] < threshold_l
+        #                 left_mean = sub_df.loc[left_mask, 'daily_ret'].mean()
+        #                 right_mean = sub_df.loc[~left_mask, 'daily_ret'].mean()
+        #                 print(
+        #                     f"lt[0] threshold_l={threshold_l:.4f}\n"
+        #                     f"left_mean={left_mean:.6f}"
+        #                     f" | right_mean={right_mean:.6f}"
+        #                 )
+        #             else:
+        #                 right_mask = sub_df['divergence'] > threshold_r
+        #                 left_mean = sub_df.loc[~right_mask, 'daily_ret'].mean()
+        #                 right_mean = sub_df.loc[right_mask, 'daily_ret'].mean()
+        #                 print(
+        #                     f"lt[1] threshold_r={threshold_r:.4f}\n"
+        #                     f"left_mean={left_mean:.6f}"
+        #                     f" | right_mean={right_mean:.6f}"
+        #                 )
+
+        #             plot.plot(sub_df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+                
+        #         i += 1
+        #         print("=======================================================")
+        #     print("")
+
+        # sub 2：foreign opt signal 優先
         if sub_analysis:
-            # df_l = df.loc[df['ind'] < 0.0025].copy()
-            df_l = df.loc[df['ind'] < 0.0095].copy()
-            df_ll = df_l.loc[df['Foreign_Opt_Signal_a'] < -0.002].copy()
-            df_lr = df_l.loc[df['Foreign_Opt_Signal_a'] >= -0.002].copy()
-            df_r = df.loc[df['ind'] >= 0.0025].copy()
-            df_r = df.loc[df['ind'] >= 0.0025].copy()
-            df_rl = df_r.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
-            df_rr = df_r.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
+            df_l = df.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
+            df_ll = df_l.loc[df_l['ind'] < 0.007].copy()
+            df_lr = df_l.loc[df_l['ind'] >= 0.007].copy()
+            df_r = df.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
+            df_rl = df_r.loc[df_r['ind'] < -0.0035].copy()
+            df_rr = df_r.loc[df_r['ind'] >= -0.0035].copy()
+
             i = 0
+
             for df in [df_l, df_r]:
-                df = df.sort_values(by='Foreign_Opt_Signal_a').reset_index(drop=True)
+                df = df.sort_values(by='ind').reset_index(drop=False)
                 df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
                 df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
                 df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
-
+                plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+                
                 if i == 0:
-                    print("--- Sub-analysis: SOX ind < 0.0025 (Left) ---")
+                    print("--- Sub-analysis: Foreign Opt Signal_a < -0.0035 (Left) ---")
                     lt = [df_ll, df_lr]
-                    threshold_l = -999
-                    threshold_r = -0.001
-                elif i == 1:
-                    print("--- Sub-analysis: SOX ind >= 0.0025 (Right) ---")
+                else:
+                    print("--- Sub-analysis: Foreign Opt Signal_a >= -0.0035 (Right) ---")
                     lt = [df_rl, df_rr]
-                    threshold_l = -0.01
-                    threshold_r = 0.02
 
                 for idx, sub_df in enumerate(lt):
-                    sub_df['3_ma'] = sub_df['Close_a'].rolling(window=3).mean()
-                    sub_df['divergence'] = (sub_df['Close_a'] / sub_df['3_ma']) - 1
+                    sub_df['MOVE_ind'] = (sub_df['MOVE_high'] / sub_df['MOVE_low']) - 1
 
-                    sub_df = sub_df.sort_values(by='divergence').reset_index(drop=True)
+                    sub_df = sub_df.sort_values(by='MOVE_ind').reset_index(drop=True)
                     sub_df['demeaned_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
                     sub_df['cum_demeaned_daily_ret'] = sub_df['demeaned_daily_ret'].cumsum()
                     sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-
                     if idx == 0:
-                        left_mask = sub_df['divergence'] < threshold_l
+                        left_mask = sub_df['MOVE_ind'] < 0.0035
                         left_mean = sub_df.loc[left_mask, 'daily_ret'].mean()
                         right_mean = sub_df.loc[~left_mask, 'daily_ret'].mean()
                         print(
-                            f"lt[0] threshold_l={threshold_l:.4f}\n"
+                            f"lt[0] MOVE_ind threshold=0.0035\n"
                             f"left_mean={left_mean:.6f}"
                             f" | right_mean={right_mean:.6f}"
                         )
                     else:
-                        right_mask = sub_df['divergence'] > threshold_r
+                        right_mask = sub_df['MOVE_ind'] > 0.0035
                         left_mean = sub_df.loc[~right_mask, 'daily_ret'].mean()
                         right_mean = sub_df.loc[right_mask, 'daily_ret'].mean()
                         print(
-                            f"lt[1] threshold_r={threshold_r:.4f}\n"
+                            f"lt[1] MOVE_ind threshold=0.0035\n"
                             f"left_mean={left_mean:.6f}"
                             f" | right_mean={right_mean:.6f}"
                         )
-
-                    plot.plot(sub_df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
-                
+                    
+                    plot.plot(sub_df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'])
                 i += 1
                 print("=======================================================")
-            print("")
+        
+        # # sub 3：加入下一天跳空
+        # if sub_analysis:
+        #     df_l, df_r = df.loc[df['ind'] < -0.006].copy(), df.loc[df['ind'] >= -0.006].copy()
+        #     for df in [df_l, df_r]:
+        #         df = df.sort_values(by='gap').reset_index(drop=True)
+        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
+        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
             return
 
     def check_risk_events(self, filter_tech_signal: bool = False) -> pd.DataFrame:
@@ -944,22 +1168,22 @@ class TXAnalyzer:
             df['daily_pnl'] = df['Open_a'].shift(-1) - df['Open']
             df['strat_ret'] = (df['daily_pnl_a'] * df['pos_night']) + (df['daily_pnl'] * df['pos_day'])
             df['benchmark_ret'] = (df['daily_pnl_a'] + df['daily_pnl'])
-            # df['benchmark_ret'] = df['daily_pnl_a']
-            df['benchmark_ret'] = df['daily_pnl']
+            df['benchmark_ret'] = df['daily_pnl_a']
+            # df['benchmark_ret'] = df['daily_pnl']
             y_label = "Points"
         else:
             df['daily_ret_a'] = (df['Open'] / df['Open_a']) - 1
             df['daily_ret'] = (df['Open_a'].shift(-1) / df['Open']) - 1
             df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
             df['benchmark_ret'] = (df['daily_ret_a'] + df['daily_ret'])
-            # df['benchmark_ret'] = df['daily_ret_a']
-            df['benchmark_ret'] = df['daily_ret']
+            df['benchmark_ret'] = df['daily_ret_a']
+            # df['benchmark_ret'] = df['daily_ret']
             y_label = "Returns (%)"
 
-        df.to_csv('test.csv', index=True)
         df['cum_strat'] = df['strat_ret'].cumsum()
         df['cum_bnh'] = df['benchmark_ret'].cumsum()
 
+        df.to_csv('backtest.csv', index=True)
         # ===============================================================
         # 4. 顯示績效統計 (Performance Metrics)
         # ===============================================================
