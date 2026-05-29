@@ -59,8 +59,9 @@ class TXAnalyzer:
         return df
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
+        # df = df.loc[df.index > '2026-03-01'].copy()
         # df = df.loc[df.index > '2024-07-09'].copy()
-        df = df.loc[df.index > '2021-10-12'].copy()
+        # df = df.loc[df.index > '2021-10-12'].copy()
         df.dropna(subset='futures_id', inplace=True)
         df['pos_night'] = 0.0
         df['pos_day'] = 0.0
@@ -810,8 +811,7 @@ class TXAnalyzer:
     def indicator_move(self, trading_session: str, sub_analysis: bool = False):
         df = self.df.copy()
         # ====== 計算指標 ======
-        df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
-        df['SOX_ind'] = df['SOX_ind'].shift(1)
+
 
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
@@ -1261,6 +1261,7 @@ class TXAnalyzer:
             formatted_df.loc[idx] = formatted_df.loc[idx].apply(lambda x: format_metrics(x, idx))
 
         display(formatted_df.T)
+        
 
         # ===============================================================
         # 5. 顯示風控事件 (Risk Events)
