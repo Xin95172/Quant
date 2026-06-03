@@ -1190,7 +1190,7 @@ class TXAnalyzer:
         res_df = res_df.sort_values(by='Date')
         return res_df
 
-    def backtest(self, risk_log: bool = False, point_version: bool = False, indicator: str = 'Foreign_Opt_Signal'):
+    def backtest(self, risk_log: bool = False, point_version: bool = False):
         """
         回測策略 (Backtest Strategy)
         """
@@ -1217,7 +1217,7 @@ class TXAnalyzer:
             df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
             df['benchmark_ret'] = (df['daily_ret_a'] + df['daily_ret'])
             df['benchmark_ret'] = df['daily_ret_a']
-            df['benchmark_ret'] = df['daily_ret']
+            # df['benchmark_ret'] = df['daily_ret']
             y_label = "Returns (%)"
 
         df['cum_strat'] = df['strat_ret'].cumsum()

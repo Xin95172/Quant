@@ -1,21 +1,34 @@
 from pathlib import Path
+import json
 import time
 
 import pandas as pd
 from tqdm import tqdm
 
 
-def get_valid_stock_ids(client, output_file: Path | None = None) -> list[str]:
+def get_valid_stock_ids(
+    client,
+    output_file: Path | None = None,
+    common_stock_only: bool = True,
+) -> list[str]:
     if output_file is not None and output_file.exists():
         cached = pd.read_parquet(output_file)
-        return sorted(cached["stock_id"].astype(str).unique().tolist())
+        stock_ids = cached["stock_id"].astype(str)
+        if common_stock_only:
+            stock_ids = stock_ids[stock_ids.str.fullmatch(r"[1-9]\d{3}")]
+        stock_ids = sorted(stock_ids.unique().tolist())
+        pd.DataFrame({"stock_id": stock_ids}).to_parquet(output_file, index=False)
+        return stock_ids
 
     info = client.taiwan_stock_info()
     info = info[info["type"].isin(["twse", "tpex"])]
     cate_mask = info["industry_category"].isin(["大盤", "Index", "所有證券"])
     id_mask = info["stock_id"].isin(["TAIEX", "TPEx"])
     info = info[~(cate_mask | id_mask)]
-    stock_ids = sorted(info["stock_id"].astype(str).unique().tolist())
+    stock_ids_series = info["stock_id"].astype(str)
+    if common_stock_only:
+        stock_ids_series = stock_ids_series[stock_ids_series.str.fullmatch(r"[1-9]\d{3}")]
+    stock_ids = sorted(stock_ids_series.unique().tolist())
 
     if output_file is not None:
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -29,6 +42,98 @@ def infer_stock_ids_from_kbar_dir(kbar_dir: Path, max_files: int = 20) -> list[s
     for path in files:
         stock_ids.update(read_kbar_ids(path))
     return sorted(stock_ids)
+
+
+def load_missing_kbar_ids(path: Path) -> dict[str, list[str]]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return {
+        str(date_str): sorted({str(stock_id) for stock_id in stock_ids})
+        for date_str, stock_ids in data.items()
+    }
+
+
+def save_missing_kbar_ids(path: Path, records: dict[str, list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {
+        str(date_str): sorted({str(stock_id) for stock_id in stock_ids})
+        for date_str, stock_ids in records.items()
+        if stock_ids
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+
+
+def get_missing_kbar_ids(path: Path, date_str: str) -> set[str]:
+    return set(load_missing_kbar_ids(path).get(date_str, []))
+
+
+def update_missing_kbar_ids(
+    path: Path,
+    date_str: str,
+    stock_ids: set[str] | list[str],
+) -> None:
+    records = load_missing_kbar_ids(path)
+    current = set(records.get(date_str, []))
+    current.update(str(stock_id) for stock_id in stock_ids)
+    records[date_str] = sorted(current)
+    save_missing_kbar_ids(path, records)
+
+
+def load_missing_full_kbar_dates(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    if isinstance(data, dict):
+        dates = data.get("missing_dates", [])
+    else:
+        dates = data
+    return {str(date_str) for date_str in dates}
+
+
+def save_missing_full_kbar_dates(path: Path, dates: set[str] | list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"missing_dates": sorted({str(date_str) for date_str in dates})}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def update_missing_full_kbar_dates(path: Path, date_str: str) -> None:
+    dates = load_missing_full_kbar_dates(path)
+    dates.add(str(date_str))
+    save_missing_full_kbar_dates(path, dates)
+
+
+def load_no_price_pairs(
+    daily_file: Path,
+    batch_size: int = 200_000,
+) -> set[tuple[str, str]]:
+    import pyarrow.parquet as pq
+
+    pairs: set[tuple[str, str]] = set()
+    parquet_file = pq.ParquetFile(daily_file)
+    columns = ["date", "stock_id", "close"]
+
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        chunk = batch.to_pandas()
+        close = pd.to_numeric(chunk["close"], errors="coerce")
+        chunk = chunk[close.fillna(0) <= 0]
+        if chunk.empty:
+            continue
+        dates = pd.to_datetime(chunk["date"]).dt.strftime("%Y-%m-%d")
+        stock_ids = chunk["stock_id"].astype(str)
+        pairs.update(zip(dates, stock_ids))
+
+    return pairs
 
 
 def compact_daily_price_parquet(
@@ -118,11 +223,12 @@ def write_filtered_from_full_kbar(
 
     expected_ids = {str(stock_id) for stock_id in stock_ids}
     full_ids = read_kbar_ids(full_file)
-    if not expected_ids.issubset(full_ids):
+    available_ids = expected_ids & full_ids
+    if not available_ids:
         return False
 
     full_df = pd.read_parquet(full_file)
-    filtered = full_df[full_df["stock_id"].astype(str).isin(expected_ids)].copy()
+    filtered = full_df[full_df["stock_id"].astype(str).isin(available_ids)].copy()
     if filtered.empty:
         return False
 
@@ -133,6 +239,35 @@ def write_filtered_from_full_kbar(
     filtered = dedupe_kbar(filtered)
     filtered.to_parquet(out_file, index=False)
     return expected_ids.issubset(read_kbar_ids(out_file))
+
+
+def read_kbar_with_supplement(
+    date_str: str,
+    stock_ids: list[str],
+    full_kbar_dir: Path,
+    supplement_dir: Path,
+) -> pd.DataFrame:
+    """Read full kbar first, then supplement missing symbols from above_ma60."""
+    expected_ids = {str(stock_id) for stock_id in stock_ids}
+    frames: list[pd.DataFrame] = []
+
+    full_file = full_kbar_dir / f"{date_str}.parquet"
+    if full_file.exists():
+        full_df = pd.read_parquet(full_file)
+        frames.append(full_df[full_df["stock_id"].astype(str).isin(expected_ids)])
+
+    supplement_file = supplement_dir / f"{date_str}.parquet"
+    if supplement_file.exists():
+        supplement_df = pd.read_parquet(supplement_file)
+        frames.append(supplement_df[supplement_df["stock_id"].astype(str).isin(expected_ids)])
+
+    if not frames:
+        return pd.DataFrame()
+
+    kbar = pd.concat(frames, ignore_index=True)
+    if kbar.empty:
+        return kbar
+    return dedupe_kbar(kbar)
 
 
 def load_or_refresh_daily_prices(
@@ -225,6 +360,7 @@ def build_above_ma_signal(
         daily["date"] = pd.to_datetime(daily["date"])
     daily["stock_id"] = daily["stock_id"].astype(str)
     daily["close"] = pd.to_numeric(daily["close"], errors="coerce")
+    daily.loc[daily["close"] <= 0, "close"] = float("nan")
     daily = daily.dropna(subset=["close"])
 
     daily = daily.sort_values(["stock_id", "date"])
@@ -280,6 +416,79 @@ def load_or_build_above_ma_signal(
 
 def signal_row_to_stock_ids(row: pd.Series) -> list[str]:
     return row[row.astype(bool)].index.astype(str).tolist()
+
+
+def build_kbar_coverage_report(
+    signal: pd.DataFrame,
+    full_kbar_dir: Path,
+    supplement_dir: Path,
+) -> pd.DataFrame:
+    records: list[dict] = []
+
+    for trade_date, signal_row in signal.sort_index().iterrows():
+        date_str = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+        signal_ids = set(signal_row_to_stock_ids(signal_row))
+
+        full_file = full_kbar_dir / f"{date_str}.parquet"
+        supplement_file = supplement_dir / f"{date_str}.parquet"
+
+        full_ids = read_kbar_ids(full_file)
+        supplement_ids = read_kbar_ids(supplement_file)
+        available_ids = full_ids | supplement_ids
+        missing_ids = signal_ids - available_ids
+
+        records.append({
+            "date": date_str,
+            "signal_count": len(signal_ids),
+            "full_exists": full_file.exists(),
+            "full_count": len(full_ids),
+            "supplement_count": len(supplement_ids),
+            "covered_count": len(signal_ids & available_ids),
+            "missing_count": len(missing_ids),
+            "missing_ids": sorted(missing_ids),
+        })
+
+    return pd.DataFrame(records)
+
+
+def chunk_list(values: list[str], chunk_size: int) -> list[list[str]]:
+    return [
+        values[i:i + chunk_size]
+        for i in range(0, len(values), chunk_size)
+    ]
+
+
+def summarize_kbar_coverage(
+    coverage: pd.DataFrame,
+    top_n: int = 30,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    display_cols = [
+        "date",
+        "signal_count",
+        "full_exists",
+        "full_count",
+        "supplement_count",
+        "covered_count",
+        "missing_count",
+    ]
+    missing_full_dates = coverage[~coverage["full_exists"]].copy()
+    incomplete_full_dates = coverage[
+        coverage["full_exists"] & (coverage["missing_count"] > 0)
+    ].copy()
+
+    missing_full_top = (
+        missing_full_dates
+        .sort_values("date", ascending=False)
+        [display_cols]
+        .head(top_n)
+    )
+    incomplete_full_top = (
+        incomplete_full_dates
+        .sort_values("missing_count", ascending=False)
+        [display_cols]
+        .head(top_n)
+    )
+    return missing_full_top, incomplete_full_top
 
 
 def build_above_ma_universe(
