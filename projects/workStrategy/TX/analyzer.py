@@ -52,9 +52,12 @@ class TXAnalyzer:
         # --- C. 15 ma divergence ---
         df['3_ma'] = df['Close_a'].rolling(window=3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+        df['3_ma_v2'] = df['Close'].rolling(window=3).mean()
+        df['divergence_v2'] = ((df['Close'] / df['3_ma_v2']) - 1).shift(1)
 
         # --- D. gap ---
         df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
+        df['gap_v2'] = (df['Open'] / df['Close'].shift(1)) - 1
 
         return df
 
@@ -115,6 +118,20 @@ class TXAnalyzer:
         # df['MOVE_ind'] = df['MOVE_ind'].shift(1)
         # move_vol_split = df['MOVE_vol'] < 0.0145
         # move_ind_split = df['MOVE_ind'] < 0
+
+        # === strat 5(日盤) ===
+            # --- condition ---
+        move_split = df['MOVE_ind'] < 0.0001
+        sox_split = df['SOX_ind'] < 0.0075
+        gap_s_l = df['gap_v2'] < 0.001
+        foreign_split = df['Foreign_Opt_Signal_a'] < -0.0035
+        divergence_f_r = df['divergence_v2'] < -0.0015
+
+            # --- execute Layers ---
+        df.loc[move_split & sox_split & ~gap_s_l, 'pos_day'] = 1.0
+        df.loc[move_split & ~sox_split, 'pos_day'] = 1.0
+        df.loc[~move_split & foreign_split, 'pos_day'] = -1.0
+        df.loc[~move_split & ~foreign_split & ~divergence_f_r, 'pos_day'] = 1.0
 
         #     # --- execute layers ---
         # df.loc[~move_vol_split, 'pos_night'] = 1.0

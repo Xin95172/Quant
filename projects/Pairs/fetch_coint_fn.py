@@ -4,6 +4,7 @@ from statsmodels.tsa.stattools import adfuller, coint
 import itertools
 from multiprocessing import Pool, cpu_count
 from functools import partial
+from pathlib import Path
 
 def adf_test(series):
     result = adfuller(series)
@@ -20,8 +21,10 @@ def check_cointegration(series1, series2):
 def process_pair(pair, spot_folder, start_time, end_time):
     symbol1, symbol2 = pair
     start_time, end_time = pd.to_datetime(start_time), pd.to_datetime(end_time)
-    data1 = pd.read_csv(f"{spot_folder}/{symbol1}.csv")
-    data2 = pd.read_csv(f"{spot_folder}/{symbol2}.csv")
+
+    spot_folder = Path(spot_folder)
+    data1 = read_symbol_data(spot_folder, symbol1)
+    data2 = read_symbol_data(spot_folder, symbol2)
     data1["Timestamp"], data2["Timestamp"] = pd.to_datetime(data1["Timestamp"]), pd.to_datetime(data2["Timestamp"])
     
     sliced_data1 = data1[(data1["Timestamp"] >= start_time) & (data1["Timestamp"] <= end_time)]
@@ -42,8 +45,29 @@ def process_pair(pair, spot_folder, start_time, end_time):
                 "pair": (symbol1, symbol2),
                 "p_value": p_value
             }
-        
+
     return None
+
+def read_symbol_data(spot_folder, symbol):
+    parquet_path = spot_folder / f"{symbol}.parquet"
+    if parquet_path.exists():
+        return normalize_symbol_data(pd.read_parquet(parquet_path))
+
+    csv_path = spot_folder / f"{symbol}.csv"
+    if csv_path.exists():
+        return normalize_symbol_data(pd.read_csv(csv_path))
+
+    raise FileNotFoundError(f"No spot data found for {symbol} in {spot_folder}")
+
+def normalize_symbol_data(data):
+    rename_map = {}
+    if "Timestamp" not in data.columns and "open_time" in data.columns:
+        rename_map["open_time"] = "Timestamp"
+    if "Close" not in data.columns and "close" in data.columns:
+        rename_map["close"] = "Close"
+    if rename_map:
+        data = data.rename(columns=rename_map)
+    return data
 
 def fetch_coint_pairs(sector_map, spot_folder, start_time, end_time, max_workers = None):
     coint_pairs = []
