@@ -9,7 +9,7 @@
   - 資料從 2019-01-01 起
   - ~1500 個交易日 × ~2.5 分/天 ≈ 62 小時
 
-儲存：每個交易日一個 parquet，存於 kbar_1min/
+儲存：每個交易日一個 parquet，存於 kbar/1min/
 斷點續傳：progress.json 記錄已完成日期
 """
 
@@ -48,7 +48,7 @@ if _QUANT_DIR is not None:
 
     OUTPUT_DIR = TW_STOCK_KBAR_1MIN
 else:
-    OUTPUT_DIR = _SCRIPT_DIR / "kbar_1min"
+    OUTPUT_DIR = _SCRIPT_DIR / "kbar" / "1min"
 PROGRESS_FILE = OUTPUT_DIR / "progress.json"
 
 START_DATE = "2019-01-01"
