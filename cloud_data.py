@@ -20,10 +20,16 @@ def dataset_index_path() -> Path:
 TM_ROOT = data_path("tm")
 TRADING_ROOT = data_path("trading")
 
-TW_STOCK_DAILY_PRICE = data_path("trading", "tw_stock", "daily_price", "daily_stock_price.parquet")
-TW_STOCK_KBAR = data_path("trading", "tw_stock", "kbar")
-TW_STOCK_KBAR_ABOVE_MA60 = data_path("trading", "tw_stock", "kbar", "above_ma60")
-TW_STOCK_KBAR_1MIN = data_path("trading", "tw_stock", "kbar_1min")
+TW_STOCK_ROOT = data_path("trading", "tw_stock")
+TW_STOCK_REFERENCE = TW_STOCK_ROOT / "reference"
+TW_STOCK_DISPOSAL = TW_STOCK_ROOT / "disposal"
+TW_STOCK_DAILY_PRICE = TW_STOCK_ROOT / "daily_price" / "daily_stock_price.parquet"
+TW_STOCK_KBAR = TW_STOCK_ROOT / "kbar"
+TW_STOCK_KBAR_ABOVE_MA60 = TW_STOCK_KBAR / "above_ma60"
+TW_STOCK_KBAR_1MIN = TW_STOCK_ROOT / "kbar_1min"
+TW_STOCK_MARGIN_INFO = TW_STOCK_REFERENCE / "margin_info.csv"
+TW_STOCK_OVERVIEW = TW_STOCK_REFERENCE / "台股總覽.csv"
+TW_STOCK_INSTITUTIONAL_TRADING = TW_STOCK_REFERENCE / "整體市場三大法人買賣表.csv"
 TW_FUTURES_TX = data_path("trading", "tw_futures", "TX.csv")
 TW_OPTIONS_TICK = data_path("trading", "tw_options", "tick")
 
