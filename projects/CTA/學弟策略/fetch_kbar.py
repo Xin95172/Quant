@@ -9,7 +9,7 @@
   - 資料從 2019-01-01 起
   - ~1500 個交易日 × ~2.5 分/天 ≈ 62 小時
 
-儲存：每個交易日一個 parquet，存於 kbar_data/
+儲存：每個交易日一個 parquet，存於 kbar_1min/
 斷點續傳：progress.json 記錄已完成日期
 """
 
@@ -34,7 +34,21 @@ try:
     _SCRIPT_DIR = Path(__file__).parent
 except NameError:
     _SCRIPT_DIR = Path.cwd()  # notebook 環境
-OUTPUT_DIR = _SCRIPT_DIR / "kbar_data"
+_QUANT_DIR = next(
+    (
+        root
+        for root in (_SCRIPT_DIR, *_SCRIPT_DIR.parents)
+        if (root / "cloud_data.py").exists()
+    ),
+    None,
+)
+if _QUANT_DIR is not None:
+    sys.path.insert(0, str(_QUANT_DIR))
+    from cloud_data import TW_STOCK_KBAR_1MIN
+
+    OUTPUT_DIR = TW_STOCK_KBAR_1MIN
+else:
+    OUTPUT_DIR = _SCRIPT_DIR / "kbar_1min"
 PROGRESS_FILE = OUTPUT_DIR / "progress.json"
 
 START_DATE = "2019-01-01"
