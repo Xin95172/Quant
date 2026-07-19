@@ -997,13 +997,14 @@ class TXAnalyzer:
         windows: range | list[int] | tuple[int, ...],
         *,
         return_column: str = 'daily_ret',
+        demean_return: bool = True,
         threshold_map: dict[int, float] | None = None,
-        grid_points: int = 100,
+        bin_percentile: float = 5,
     ) -> pd.DataFrame:
-        """Compress the original divergence-sorted curves into one heatmap.
+        """Show divergence-sorted daily returns in one heatmap.
 
-        Each row is one MA window. Each cell is the original
-        ``cum_demeaned_daily_ret`` at that window's divergence percentile.
+        Each row is one MA window. Each cell is the mean return in a
+        divergence-percentile bin. Set ``demean_return=False`` for raw returns.
         Hover to read the raw divergence at any cell. Pass manually observed
         thresholds in ``threshold_map`` to mark them in red.
         """
@@ -1013,35 +1014,45 @@ class TXAnalyzer:
             raise ValueError('windows must contain moving-average lengths of at least 2')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
-        if grid_points < 20:
-            raise ValueError('grid_points must be at least 20')
+        if not 0 < bin_percentile <= 25:
+            raise ValueError('bin_percentile must be greater than 0 and at most 25')
 
         threshold_map = threshold_map or {}
+        value_label = f'Demeaned {return_column}' if demean_return else return_column
+        value_title = value_label.replace(' ', '_')
         summary = []
         heatmap_values = []
         heatmap_divergence = []
-        percentiles = np.linspace(0, 100, grid_points)
+        bin_edges = np.append(np.arange(0, 100, bin_percentile), 100.0)
+        percentiles = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
         fig = go.Figure()
 
         for window in windows:
             divergence = ((self.df['Close'] / self.df['Close'].rolling(window=window).mean()) - 1).shift(1)
             frame = pd.DataFrame({'divergence': divergence, 'return': self.df[return_column]}).dropna()
             if frame.empty:
-                summary.append({'window': window, 'observations': 0, 'minimum_cum_demeaned_return': np.nan, 'divergence_at_minimum': np.nan})
-                heatmap_values.append(np.full(grid_points, np.nan))
-                heatmap_divergence.append(np.full(grid_points, np.nan))
+                summary.append({'window': window, 'observations': 0, 'minimum_return': np.nan, 'divergence_at_minimum': np.nan})
+                heatmap_values.append(np.full(len(percentiles), np.nan))
+                heatmap_divergence.append(np.full(len(percentiles), np.nan))
                 continue
 
             frame = frame.sort_values('divergence').reset_index(drop=True)
-            frame['cum_demeaned_return'] = (frame['return'] - frame['return'].mean()).cumsum()
-            source_percentiles = np.linspace(0, 100, len(frame))
-            heatmap_values.append(np.interp(percentiles, source_percentiles, frame['cum_demeaned_return']))
-            heatmap_divergence.append(np.interp(percentiles, source_percentiles, frame['divergence']))
-            minimum = frame.loc[frame['cum_demeaned_return'].idxmin()]
+            frame['display_return'] = frame['return'] - frame['return'].mean() if demean_return else frame['return']
+            frame['divergence_percentile'] = (np.arange(len(frame)) + 1) / len(frame) * 100
+            bin_means = []
+            bin_divergence = []
+            for lower, upper in zip(bin_edges[:-1], bin_edges[1:]):
+                values = frame.loc[(frame['divergence_percentile'] > lower) & (frame['divergence_percentile'] <= upper)]
+                bin_means.append(values['display_return'].mean())
+                bin_divergence.append(values['divergence'].mean())
+            heatmap_values.append(bin_means)
+            heatmap_divergence.append(bin_divergence)
+            minimum = frame.loc[frame['display_return'].idxmin()]
             summary.append({
                 'window': window,
                 'observations': len(frame),
-                'minimum_cum_demeaned_return': minimum['cum_demeaned_return'],
+                'minimum_return': minimum['display_return'],
                 'divergence_at_minimum': minimum['divergence'],
             })
 
@@ -1051,10 +1062,11 @@ class TXAnalyzer:
                 y=windows,
                 z=np.asarray(heatmap_values),
                 customdata=np.asarray(heatmap_divergence),
+                text=np.tile(bin_labels, (len(windows), 1)),
                 colorscale='RdBu',
                 zmid=0,
-                colorbar=dict(title='Cumulative demeaned<br>daily return', tickformat='.1%'),
-                hovertemplate='MA window: %{y}<br>Divergence percentile: %{x:.1f}%<br>Raw divergence: %{customdata:.4%}<br>Cumulative demeaned daily return: %{z:.3%}<extra></extra>',
+                colorbar=dict(title=value_title.replace('_', '<br>', 1), tickformat='.1%'),
+                hovertemplate=f'MA window: %{{y}}<br>Divergence percentile bin: %{{text}}<br>Raw divergence: %{{customdata:.4%}}<br>{value_title}: %{{z:.3%}}<extra></extra>',
             )
         )
         marker_x = []
@@ -1080,7 +1092,7 @@ class TXAnalyzer:
                 )
             )
         fig.update_layout(
-            title='MA divergence: cumulative demeaned daily return heatmap',
+            title=f'MA divergence: {value_title} heatmap',
             template='plotly_white',
             height=620,
             hovermode='closest',
@@ -1089,7 +1101,6 @@ class TXAnalyzer:
         fig.update_xaxes(title_text='Divergence percentile within each MA window', range=[0, 100])
         fig.update_yaxes(title_text='MA window')
         fig.show()
-        return pd.DataFrame(summary).set_index('window')
 
     def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
