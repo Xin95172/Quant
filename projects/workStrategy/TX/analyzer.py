@@ -1,13 +1,100 @@
-import pandas as pd
+from dataclasses import dataclass
+from pathlib import Path
+import time
+
 import numpy as np
+import pandas as pd
 import module.plot_func as plot
 import plotly.graph_objects as go
 from IPython.display import display
 
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Parameters for the active TX day-session strategy."""
+
+    backtest_start_date: str = '2026-03-01'
+    move_threshold: float = 0.0001
+    sox_threshold: float = 0.0075
+    gap_threshold: float = 0.001
+    foreign_option_threshold: float = -0.0035
+    divergence_threshold: float = -0.0015
+    day_long_position: float = 1.0
+    day_short_position: float = -1.0
+    night_position: float = 0.0
+
+
+class StrategyEngine:
+    """Stateless factor and position logic for the active TX strategy."""
+
+    REQUIRED_COLUMNS = {
+        'futures_id', 'Open', 'Close', 'Close_a', 'MOVE_open', 'MOVE_high', 'MOVE_low', 'MOVE_close',
+        'SOX_open', 'SOX_close', 'Foreign_Opt_Signal_a',
+    }
+
+    @classmethod
+    def calculate_factors(cls, frame: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy of the frame with all strategy-derived factor columns."""
+        missing_columns = cls.REQUIRED_COLUMNS - set(frame.columns)
+        if missing_columns:
+            raise KeyError(f"strategy data missing columns: {sorted(missing_columns)}")
+
+        df = frame.copy()
+        df['SOX_ind'] = ((df['SOX_close'] / df['SOX_open']) - 1).shift(1).ffill()
+        df['MOVE_ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
+        df['MOVE_vol'] = ((df['MOVE_high'] / df['MOVE_low']) - 1).shift(1)
+
+        df['3_ma'] = df['Close_a'].rolling(window=3).mean()
+        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+        df['3_ma_v2'] = df['Close'].rolling(window=3).mean()
+        df['divergence_v2'] = ((df['Close'] / df['3_ma_v2']) - 1).shift(1)
+        df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
+        df['gap_v2'] = (df['Open'] / df['Close'].shift(1)) - 1
+        return df
+
+    @staticmethod
+    def apply_positions(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+        """Return active day and night positions for a factor-ready frame."""
+        df = frame.loc[frame.index > config.backtest_start_date].copy()
+        df.dropna(subset='futures_id', inplace=True)
+        df['pos_night'] = config.night_position
+        df['pos_day'] = 0.0
+
+        move_below_threshold = df['MOVE_ind'] < config.move_threshold
+        sox_below_threshold = df['SOX_ind'] < config.sox_threshold
+        foreign_option_bearish = df['Foreign_Opt_Signal_a'] < config.foreign_option_threshold
+
+        base_gap_supports_long = df['gap'] < config.gap_threshold
+        base_divergence_supports_long = df['divergence'] < config.divergence_threshold
+        df.loc[move_below_threshold & sox_below_threshold & ~base_gap_supports_long, 'pos_day'] = config.day_long_position
+        df.loc[move_below_threshold & ~sox_below_threshold, 'pos_day'] = config.day_long_position
+        df.loc[~move_below_threshold & foreign_option_bearish, 'pos_day'] = config.day_short_position
+        df.loc[~move_below_threshold & ~foreign_option_bearish & ~base_divergence_supports_long, 'pos_day'] = config.day_long_position
+
+        final_divergence_supports_long = df['divergence_v2'] < config.divergence_threshold
+        df.loc[move_below_threshold, 'pos_day'] = config.day_long_position
+        df.loc[~move_below_threshold & foreign_option_bearish, 'pos_day'] = config.day_short_position
+        df.loc[~move_below_threshold & ~foreign_option_bearish & ~final_divergence_supports_long, 'pos_day'] = config.day_long_position
+        return df
+
+
 class TXAnalyzer:
-    def __init__(self, df: pd.DataFrame):
+    """Notebook-facing facade for TX features, diagnostics, and backtesting."""
+
+    # Construction and core state -------------------------------------------------
+    def __init__(self, df: pd.DataFrame, config: StrategyConfig | None = None):
+        self.config = config or StrategyConfig()
+        df = df.copy()
+        df.index = pd.to_datetime(df.index).normalize()
         df_day = df[df['trading_session'] == 'position'].copy()
         df_night = df[df['trading_session'] == 'after_market'].copy()
+
+        if df_day.index.duplicated().any() or df_night.index.duplicated().any():
+            raise ValueError('each trading session must contain at most one row per close date')
             
         df_night = df_night.add_suffix('_a')
             
@@ -23,120 +110,88 @@ class TXAnalyzer:
         self.df['daily_pnl_a'] = self.df['Close_a'] - self.df['Open_a']
         self.df['cum_daily_pnl_a'] = self.df['daily_pnl_a'].cumsum()
     
-    def _get_statistics(self, ret_col: pd.Series):
+    def _get_statistics(self, ret_col: pd.Series) -> pd.Series:
         return ret_col.describe()
+
+    def set_config(self, config: StrategyConfig) -> None:
+        """Replace the active strategy configuration for subsequent analysis and backtests."""
+        self.config = config
+
+    def session_alignment_report(self) -> pd.Series:
+        """Check day and night session pairing under the close-date convention.
+
+        The night session labeled ``D`` is expected to close before the day session
+        labeled ``D`` opens, so both must share the same normalized date.
+        """
+        day_available = self.df[['Open', 'Close']].notna().all(axis=1)
+        night_available = self.df[['Open_a', 'Close_a']].notna().all(axis=1)
+        paired = day_available & night_available
+        return pd.Series({
+            'total_dates': len(self.df),
+            'paired_day_night_dates': int(paired.sum()),
+            'day_only_dates': int((day_available & ~night_available).sum()),
+            'night_only_dates': int((~day_available & night_available).sum()),
+            'missing_both_dates': int((~day_available & ~night_available).sum()),
+            'duplicate_dates': int(self.df.index.duplicated().sum()),
+            'close_date_alignment_ok': bool(paired.all() and not self.df.index.duplicated().any()),
+        }, name='session_alignment')
+
+    def for_period(
+        self,
+        *,
+        start: str | pd.Timestamp | None = None,
+        end: str | pd.Timestamp | None = None,
+    ) -> "TXAnalyzer":
+        """Return an independent analyzer view limited to an inclusive date range."""
+        frame = self.df
+        if start is not None:
+            frame = frame.loc[frame.index >= pd.Timestamp(start)]
+        if end is not None:
+            frame = frame.loc[frame.index <= pd.Timestamp(end)]
+
+        view = object.__new__(TXAnalyzer)
+        view.config = self.config
+        view.df = frame.copy()
+        return view
+
+    @staticmethod
+    def split_periods(
+        index: pd.Index,
+        *,
+        start: str | pd.Timestamp | None = None,
+        train_ratio: float = 0.6,
+        validation_ratio: float = 0.2,
+    ) -> dict[str, pd.Timestamp]:
+        """Split ordered trading dates into train, validation, and test periods."""
+        if train_ratio <= 0 or validation_ratio <= 0 or train_ratio + validation_ratio >= 1:
+            raise ValueError('train_ratio and validation_ratio must be positive and sum to less than 1')
+
+        dates = pd.DatetimeIndex(pd.to_datetime(index)).normalize().unique().sort_values()
+        if start is not None:
+            dates = dates[dates > pd.Timestamp(start)]
+        if len(dates) < 3:
+            raise ValueError('at least three trading dates are required to create train, validation, and test periods')
+
+        train_count = max(1, int(len(dates) * train_ratio))
+        validation_count = max(1, int(len(dates) * validation_ratio))
+        if train_count + validation_count >= len(dates):
+            raise ValueError('split ratios leave no trading dates for the test period')
+
+        return {
+            'train_end': dates[train_count - 1],
+            'validation_start': dates[train_count],
+            'validation_end': dates[train_count + validation_count - 1],
+            'test_start': dates[train_count + validation_count],
+        }
     
-    def display_df(self):
+    def display_df(self) -> pd.DataFrame:
         return self.df
     
     def _calculate_factors(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Helper to calculate all strategy factors."""
-        # --- A. SOX ---
-            # strat 2
-        # df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
-        # df['SOX_ind'] = df['SOX'].rolling(window=3).mean()  # 3ma
-        # df['SOX_ind'] = df['SOX_ind'].shift(2)
-        # df['SOX_ind'] = df['SOX_ind'].ffill()
-
-            # strat 3
-        df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
-        df['SOX_ind'] = df['SOX_ind'].shift(1)
-        df['SOX_ind'] = df['SOX_ind'].ffill()
-
-        # --- B. MOVE ---
-            # strat 3
-        df['MOVE_ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
-        df['MOVE_vol'] = (df['MOVE_high'] / df['MOVE_low']) - 1
-        df['MOVE_vol'] = df['MOVE_vol'].shift(1)
-
-        # --- C. 15 ma divergence ---
-        df['3_ma'] = df['Close_a'].rolling(window=3).mean()
-        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
-        df['3_ma_v2'] = df['Close'].rolling(window=3).mean()
-        df['divergence_v2'] = ((df['Close'] / df['3_ma_v2']) - 1).shift(1)
-
-        # --- D. gap ---
-        df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
-        df['gap_v2'] = (df['Open'] / df['Close'].shift(1)) - 1
-
-        return df
+        return StrategyEngine.calculate_factors(df)
 
     def _apply_signals_logic(self, df: pd.DataFrame) -> pd.DataFrame:
-        # df = df.loc[df.index > '2026-03-01'].copy()
-        # df = df.loc[df.index > '2024-07-09'].copy()
-        # df = df.loc[df.index > '2021-10-12'].copy()
-        df.dropna(subset='futures_id', inplace=True)
-        df['pos_night'] = 0.0
-        df['pos_day'] = 0.0
-
-        # === strat 1 ===
-        #   # --- condition ---
-        # foreign_opt_short = df['Foreign_Opt_Signal_a'] < -0.0035 # option 偏空
-        # condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
-
-        #   # --- execute Layers ---
-        # df.loc[condition_day, 'pos_day'] = 1.0
-        # df.loc[foreign_opt_short, 'pos_day'] = -1.0
-
-        # df.loc[df['opt_pos'] > 0.012, 'pos_night'] = 0.0
-        # df.loc[df['opt_pos'] < 0.012, 'pos_night'] = 1.0
-
-        # # === strat 2 ===
-        # #     --- condition ---
-        # sox_split = df['SOX_ind'] < 0.0025
-        # foreign_opt_l = df['Foreign_Opt_Signal_a'] < -0.002
-        # foreign_opt_r = df['Foreign_Opt_Signal_a'] < -0.0035
-        # divergence_lr = df['divergence'] < -0.001
-        # divergence_rl = df['divergence'] < -0.01
-        # divergence_rr = df['divergence'] < 0.02
-        
-        #     # --- execute Layers ---
-        # df['Foreign_Opt_Signal_a'] = df['Foreign_Opt_Signal_a'].ffill()
-        # df['divergence'] = df['divergence'].ffill()
-        # df.loc[sox_split & (foreign_opt_l | ~foreign_opt_l & divergence_lr), 'pos_day'] = -1.0
-        # df.loc[sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = -1.0
-        # df.loc[sox_split & (~foreign_opt_l & ~divergence_lr), 'pos_day'] = 1.0
-        # df.loc[~sox_split & ((foreign_opt_r & divergence_rl) | (~foreign_opt_r & divergence_rr)), 'pos_day'] = 1.0
-        # df.loc[~sox_split & (df['Foreign_Opt_Signal_a'].isna() | df['divergence'].isna()), 'pos_day'] = 1.0
-
-        # === strat 3(日盤) ===
-            # --- condition ---
-        move_split = df['MOVE_ind'] < 0.0001
-        sox_split = df['SOX_ind'] < 0.0075
-        gap_s_l = df['gap'] < 0.001
-        foreign_split = df['Foreign_Opt_Signal_a'] < -0.0035
-        divergence_f_r = df['divergence'] < -0.0015
-
-            # --- execute Layers ---
-        df.loc[move_split & sox_split & ~gap_s_l, 'pos_day'] = 1.0
-        df.loc[move_split & ~sox_split, 'pos_day'] = 1.0
-        df.loc[~move_split & foreign_split, 'pos_day'] = -1.0
-        df.loc[~move_split & ~foreign_split & ~divergence_f_r, 'pos_day'] = 1.0
-        
-        # # === strat 4(夜盤) ===
-        #     # --- condition ---
-        # df['MOVE_ind'] = df['MOVE_ind'].shift(1)
-        # move_vol_split = df['MOVE_vol'] < 0.0145
-        # move_ind_split = df['MOVE_ind'] < 0
-
-        # === strat 5(日盤) ===
-            # --- condition ---
-        move_split = df['MOVE_ind'] < 0.0001
-        sox_split = df['SOX_ind'] < 0.0075
-        gap_s_l = df['gap_v2'] < 0.001
-        foreign_split = df['Foreign_Opt_Signal_a'] < -0.0035
-        divergence_f_r = df['divergence_v2'] < -0.0015
-
-            # --- execute Layers ---
-        df.loc[move_split & sox_split & ~gap_s_l, 'pos_day'] = 1.0
-        df.loc[move_split & ~sox_split, 'pos_day'] = 1.0
-        df.loc[~move_split & foreign_split, 'pos_day'] = -1.0
-        df.loc[~move_split & ~foreign_split & ~divergence_f_r, 'pos_day'] = 1.0
-
-        #     # --- execute layers ---
-        # df.loc[~move_vol_split, 'pos_night'] = 1.0
-
-        return df
+        return StrategyEngine.apply_positions(df, self.config)
 
     def _calculate_metrics(self, returns: pd.Series, point_version: bool = False) -> dict:
         """
@@ -253,12 +308,271 @@ class TXAnalyzer:
             'Kelly': kelly
         }
 
-    def update_df(self, df):
+    def update_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Replace the working frame after an explicit research transformation."""
         self.df = df
         return self.df
 
+    # Feature pipeline ------------------------------------------------------------
+    def merge_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Left-join date-indexed features onto the strategy frame."""
+        features = features.copy()
+        features.index = pd.to_datetime(features.index).normalize()
+        features = features.loc[~features.index.duplicated(keep='last')]
+
+        df = self.df.copy()
+        df.index = pd.to_datetime(df.index).normalize()
+        df = df.drop(columns=features.columns.intersection(df.columns))
+        self.df = df.join(features, how='left')
+        return self.df
+
+    def add_market_ohlc(self, market_df: pd.DataFrame, prefix: str, *, shift: int = 1) -> pd.DataFrame:
+        """Add a daily market OHLC series with a consistent factor prefix."""
+        required_columns = ['open', 'high', 'low', 'close']
+        missing_columns = set(required_columns) - set(market_df.columns)
+        if missing_columns:
+            raise KeyError(f"{prefix} missing OHLC columns: {sorted(missing_columns)}")
+
+        features = market_df[required_columns].copy()
+        features.index = pd.to_datetime(features.index).normalize()
+        if shift:
+            features = features.shift(shift)
+        features = features.rename(columns={column: f'{prefix}_{column}' for column in required_columns})
+        return self.merge_features(features)
+
+    @staticmethod
+    def build_option_signals(
+        day_df: pd.DataFrame,
+        night_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Convert day and night institutional option data into strategy signals."""
+        if day_df.empty:
+            day_signal = pd.DataFrame(columns=['Foreign_Opt_Signal', 'Dealer_Opt_Signal'])
+        else:
+            required_columns = {'date', 'call_put', 'institutional_investors', 'long_deal_amount', 'short_deal_amount'}
+            missing_columns = required_columns - set(day_df.columns)
+            if missing_columns:
+                raise KeyError(f"day option data missing columns: {sorted(missing_columns)}")
+
+            day_data = day_df.copy()
+            day_data['date'] = pd.to_datetime(day_data['date']).dt.normalize()
+            day_data['call_put'] = day_data['call_put'].replace({
+                '買權': 'CALL', '賣權': 'PUT', 'Call': 'CALL', 'Put': 'PUT',
+            })
+            day_data['net_amount'] = day_data['long_deal_amount'] - day_data['short_deal_amount']
+            day_data['turnover'] = day_data['long_deal_amount'] + day_data['short_deal_amount']
+            pivot = day_data.pivot_table(
+                index='date',
+                columns=['institutional_investors', 'call_put'],
+                values=['net_amount', 'turnover'],
+                aggfunc='sum',
+                fill_value=0,
+            )
+
+            def signal_for(institution: str) -> pd.Series:
+                net_call = pivot.get(('net_amount', institution, 'CALL'), pd.Series(0, index=pivot.index))
+                net_put = pivot.get(('net_amount', institution, 'PUT'), pd.Series(0, index=pivot.index))
+                call_turnover = pivot.get(('turnover', institution, 'CALL'), pd.Series(0, index=pivot.index))
+                put_turnover = pivot.get(('turnover', institution, 'PUT'), pd.Series(0, index=pivot.index))
+                return (net_call - net_put) / (call_turnover + put_turnover).replace(0, np.nan)
+
+            day_signal = pd.DataFrame(index=pivot.index)
+            day_signal['Foreign_Opt_Signal'] = signal_for('外資')
+            day_signal['Dealer_Opt_Signal'] = signal_for('自營商')
+
+        if night_df.empty:
+            night_signal = pd.DataFrame(columns=['Foreign_Opt_Signal_a'])
+        else:
+            required_columns = {
+                'foreign_long_call_amount', 'foreign_short_call_amount',
+                'foreign_long_put_amount', 'foreign_short_put_amount',
+            }
+            missing_columns = required_columns - set(night_df.columns)
+            if missing_columns:
+                raise KeyError(f"night option data missing columns: {sorted(missing_columns)}")
+
+            night_data = night_df.copy()
+            night_data.index = pd.to_datetime(night_data.index).normalize()
+            net_call = night_data['foreign_long_call_amount'] - night_data['foreign_short_call_amount']
+            net_put = night_data['foreign_long_put_amount'] - night_data['foreign_short_put_amount']
+            turnover = night_data[list(required_columns)].sum(axis=1).replace(0, np.nan)
+            night_signal = pd.DataFrame({'Foreign_Opt_Signal_a': (net_call - net_put) / turnover})
+
+        return day_signal.join(night_signal, how='outer')
+
+    def add_option_signals(self, day_df: pd.DataFrame, night_df: pd.DataFrame) -> pd.DataFrame:
+        """Build and merge institutional option signals."""
+        return self.merge_features(self.build_option_signals(day_df, night_df))
+
+    @staticmethod
+    def fetch_option_daily(
+        client,
+        option_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        pause_seconds: float = 0.5,
+    ) -> pd.DataFrame:
+        """Download option daily data in yearly batches to avoid API request limits."""
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        period_starts = pd.date_range(start=start, end=end, freq='YS')
+        if start not in period_starts:
+            period_starts = period_starts.insert(0, start).sort_values().unique()
+
+        chunks = []
+        for period_start in period_starts:
+            period_end = min(period_start + pd.offsets.YearEnd(0), end)
+            if period_start > period_end:
+                continue
+
+            option_part = client.get_option_daily(
+                option_id=option_id,
+                start_date=period_start,
+                end_date=period_end,
+                trading_session='all',
+            )
+            if not option_part.empty:
+                chunks.append(option_part)
+            if pause_seconds:
+                time.sleep(pause_seconds)
+
+        if not chunks:
+            raise RuntimeError(f'未下載到 {option_id} 選擇權資料')
+        return pd.concat(chunks, ignore_index=True)
+
+    def add_option_iv_skew(
+        self,
+        option_df: pd.DataFrame,
+        settlement_df: pd.DataFrame,
+        *,
+        iv_calculator,
+        risk_free_rate: float = 0.015,
+    ) -> pd.DataFrame:
+        """Calculate option IV skew by session and merge it into the strategy frame."""
+        required_option_columns = {'date', 'trading_session', 'contract_date'}
+        missing_option_columns = required_option_columns - set(option_df.columns)
+        if missing_option_columns:
+            raise KeyError(f"option data missing columns: {sorted(missing_option_columns)}")
+        required_settlement_columns = {'contract', 'settle_date'}
+        missing_settlement_columns = required_settlement_columns - set(settlement_df.columns)
+        if missing_settlement_columns:
+            raise KeyError(f"settlement data missing columns: {sorted(missing_settlement_columns)}")
+
+        options = option_df.copy()
+        options['date'] = pd.to_datetime(options['date']).dt.normalize()
+        spot = self.df[['Close', 'Close_a']].copy()
+        spot.index = pd.to_datetime(spot.index).normalize()
+        options = options.merge(spot, left_on='date', right_index=True, how='left')
+        options['underlying_price'] = np.where(
+            options['trading_session'].eq('after_market'), options['Close_a'], options['Close']
+        )
+
+        settlements = settlement_df.copy()
+        settlements['settle_date'] = pd.to_datetime(settlements['settle_date'])
+        iv_df = iv_calculator(
+            options,
+            model='bs',
+            underlying_col='underlying_price',
+            risk_free_rate=risk_free_rate,
+            shape_options={'group_cols': ['date', 'contract_date', 'trading_session']},
+            settlement_df=settlements,
+            settlement_contract_col='contract',
+            settlement_date_col='settle_date',
+        )
+        required_iv_columns = {'date', 'trading_session', 'SkewSlope', 'SkewSlope3'}
+        missing_iv_columns = required_iv_columns - set(iv_df.columns)
+        if missing_iv_columns:
+            raise KeyError(f"IV calculation missing columns: {sorted(missing_iv_columns)}")
+
+        skew = iv_df.groupby(['date', 'trading_session'])[['SkewSlope', 'SkewSlope3']].first().unstack('trading_session')
+        skew.columns = [
+            factor if session == 'position' else f'{factor}_a'
+            for factor, session in skew.columns
+        ]
+        return self.merge_features(skew)
+
+    @staticmethod
+    def fetch_fear_greed(timeout: int = 15) -> pd.DataFrame:
+        """Fetch the current CNN Fear & Greed history in a stable tabular shape."""
+        import requests
+
+        response = requests.get(
+            'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
+            headers={
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/122.0 Safari/537.36'
+                )
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        history = response.json().get('fear_and_greed_historical', {}).get('data', [])
+        if not history:
+            return pd.DataFrame(columns=['date', 'score', 'rating'])
+
+        fear_greed = pd.DataFrame(history)
+        fear_greed['date'] = pd.to_datetime(fear_greed['x'], unit='ms')
+        return (
+            fear_greed.rename(columns={'y': 'score'})[['date', 'score', 'rating']]
+            .sort_values('date')
+            .reset_index(drop=True)
+        )
+
+    def add_fear_greed(self, historical_df: pd.DataFrame, latest_df: pd.DataFrame) -> pd.DataFrame:
+        """Merge historical and current CNN Fear & Greed observations, then lag one day."""
+        historical = historical_df.copy()
+        latest = latest_df.copy()
+        latest = latest.rename(columns={'score': 'fear_greed', 'rating': 'fear_greed_emotion'})
+        columns = ['fear_greed', 'fear_greed_emotion']
+
+        def normalize(frame: pd.DataFrame) -> pd.DataFrame:
+            if 'date' in frame.columns:
+                frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+                frame = frame.set_index('date')
+            else:
+                frame.index = pd.to_datetime(frame.index).normalize()
+            for column in columns:
+                if column not in frame:
+                    frame[column] = pd.NA
+            return frame[columns].loc[~frame.index.duplicated(keep='last')]
+
+        historical = normalize(historical)
+        latest = normalize(latest)
+        combined = historical.reindex(historical.index.union(latest.index))
+        combined.update(latest)
+        combined['fear_greed'] = pd.to_numeric(combined['fear_greed'], errors='coerce')
+        return self.merge_features(combined.sort_index().shift(1))
+
+    def feature_status(self, columns: list[str] | None = None) -> pd.DataFrame:
+        """Summarize feature availability before analysis or backtesting."""
+        if columns is None:
+            columns = [
+                'MOVE_open', 'SOX_open', 'Foreign_Opt_Signal_a',
+                'SkewSlope', 'fear_greed', 'US_bond_5y',
+            ]
+
+        status = []
+        for column in columns:
+            if column not in self.df:
+                status.append({'feature': column, 'available': False, 'missing': len(self.df), 'last_value_date': pd.NaT})
+                continue
+
+            values = self.df[column]
+            valid_dates = values.dropna().index
+            status.append({
+                'feature': column,
+                'available': True,
+                'missing': int(values.isna().sum()),
+                'last_value_date': valid_dates.max() if len(valid_dates) else pd.NaT,
+            })
+        return pd.DataFrame(status).set_index('feature')
+
+    # Performance summaries -------------------------------------------------------
     def daily_ret(self):
-        return plot.plot(self.df, ly=['cum_daily_ret', 'cum_daily_ret_a'])
+        return plot.plot(self.df, ly=['cum_daily_ret', 'cum_daily_ret_a'], title='daily_return')
 
     def monthly_ret(self, mode: str = 'strategy', point_version: bool = False):
         """
@@ -347,6 +661,8 @@ class TXAnalyzer:
         )
         
         fig.show()
+
+    # Factor diagnostics ----------------------------------------------------------
     def indicator_position_ret(self):
         df = self.df.copy()
         df['ind'] = df['daily_ret'].shift(1) + df['daily_ret_a'].shift(1) + df['daily_ret'].shift(2)
@@ -404,9 +720,10 @@ class TXAnalyzer:
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
             
-            return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='pos_day', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='pos_day', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title='gap_days_after_holiday')
 
-        return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+        period = 'after_holiday' if after_holiday else 'before_holiday'
+        return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'gap_days_{period}')
 
     def indicator_maintenance_rate(self, point_version: bool = False):
         if 'TotalExchangeMarginMaintenance' not in self.df.columns:
@@ -424,7 +741,7 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
 
-        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title='margin_maintenance_rate')
 
     def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = ['day', 'night']):
         df = self.df.copy()
@@ -433,14 +750,14 @@ class TXAnalyzer:
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'])
+            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'], title='option_iv_night')
         elif trading_session == 'night':
             df['SkewSlope'] = df['SkewSlope'].shift(1)
             df = df.sort_values(by='SkewSlope').reset_index(drop=True)
             df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
             df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'])
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'], title='option_iv_day')
     
     def indicator_opt_position(self, indicator: str = 'Foreign_Opt_Signal', trading_session: str = 'day' or 'night', sub_analysis: bool = False, time_series_analysis: bool = False):
         # Foreign_Opt_Signal, Dealer_Opt_Signal
@@ -468,9 +785,9 @@ class TXAnalyzer:
                     df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
                     df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
                     df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'])
+                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'], title=f'option_position_day_{indicator}_move_split')
             else:
-                return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'])
+                return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'], title=f'option_position_day_{indicator}')
 
         elif trading_session == 'night':
             df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[f'{indicator}'].shift(1)
@@ -478,12 +795,12 @@ class TXAnalyzer:
             if time_series_analysis:
                 df['signal'] = df['pos_continue'] > 0.012
                 df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-                return plot.plot(df, ly=['cum_daily_ret_a'], ry='signal', ry_dashed=False)
+                return plot.plot(df, ly=['cum_daily_ret_a'], ry='signal', ry_dashed=False, title=f'option_position_night_{indicator}_time_series')
             df = df.sort_values(by='pos_continue').reset_index(drop=True)
             df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
             df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'])
+            return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'], title=f'option_position_night_{indicator}')
 
     def check_volatility(self, window: int = 20):
         """
@@ -643,7 +960,7 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
-        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='avg_margin_delta', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'])
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='avg_margin_delta', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'], title='margin_delta')
 
     def indicator_institutional_flow(self):
         temp_df = self.df.copy()
@@ -659,10 +976,10 @@ class TXAnalyzer:
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='foreign_inflow', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'])
 
-    def indicator_15ma_divergence(self):
+    def indicator_15ma_divergence(self, window: int = 15):
         temp_df = self.df.copy()
-        temp_df['15_ma'] = temp_df['Close'].rolling(window=15).mean()
-        temp_df['divergence'] = (temp_df['Close'] / temp_df['15_ma']) - 1
+        temp_df[f'{window}_ma'] = temp_df['Close'].rolling(window=window).mean()
+        temp_df['divergence'] = (temp_df['Close'] / temp_df[f'{window}_ma']) - 1
         temp_df['divergence'] = temp_df['divergence'].shift(1)
         temp_df = temp_df.dropna(subset=['divergence'])
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
@@ -673,7 +990,7 @@ class TXAnalyzer:
         temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
-        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}ma_divergence')
 
     def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
@@ -694,7 +1011,7 @@ class TXAnalyzer:
         df = df.sort_values(by='divergence').reset_index(drop=True)
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
+        return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'], title='night_price')
 
     def indicator_spread(self, window: int = 5):
         df = self.df.copy()
@@ -726,9 +1043,6 @@ class TXAnalyzer:
         # Rename index for better readability
         weekday_map = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
         weekday_stats.index = weekday_stats.index.map(weekday_map)
-        
-        print("=== Weekday Average Returns ===")
-        display(weekday_stats)
         
         # Plot
         fig = px.bar(
@@ -768,7 +1082,7 @@ class TXAnalyzer:
             temp_df['cum_demean_daily_ret'] = temp_df['demean_daily_ret'].cumsum()
             temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
             temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
-            return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'])
+            return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'us_bond_{indicator}')
 
     def indicator_structural_weakness(self):
         """
@@ -802,7 +1116,8 @@ class TXAnalyzer:
 
     def indicator_fear_greed(self, trading_session: str, time_series_analysis: bool = False):
         df = self.df.copy()
-        df.to_csv('test1.csv', index=True)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        df.to_csv(OUTPUT_DIR / 'fear_greed_day.csv', index=True)
 
         if trading_session == 'night':
             df['fear_greed'] = df['fear_greed'].shift(1)
@@ -818,12 +1133,13 @@ class TXAnalyzer:
         df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
         df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        df.to_csv('test2.csv', index=True)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        df.to_csv(OUTPUT_DIR / 'fear_greed_night.csv', index=True)
 
         if trading_session == 'night':
-            return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='delta_fear_greed', sub_ly=['cum_daily_ret_a'])
+            return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='delta_fear_greed', sub_ly=['cum_daily_ret_a'], title='fear_greed_night')
         elif trading_session == 'day':
-            return plot.plot(df, ly=['cum_demean_daily_ret'], ry='delta_fear_greed', sub_ly=['cum_daily_ret'])
+            return plot.plot(df, ly=['cum_demean_daily_ret'], ry='delta_fear_greed', sub_ly=['cum_daily_ret'], title='fear_greed_day')
 
     def indicator_move(self, trading_session: str, sub_analysis: bool = False):
         df = self.df.copy()
@@ -851,7 +1167,7 @@ class TXAnalyzer:
             df = df.sort_values(by='MOVE_vol').reset_index(drop=True)
             df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-            plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='MOVE_vol', sub_ly=['cum_daily_ret_a'])
+            plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='MOVE_vol', sub_ly=['cum_daily_ret_a'], title='move_night')
 
             print("==================\n==================")
 
@@ -900,7 +1216,7 @@ class TXAnalyzer:
             df = df.sort_values(by='ind').reset_index(drop=True)
             df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+            plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='move_day')
 
             print("==================\n==================")
 
@@ -966,7 +1282,7 @@ class TXAnalyzer:
                 df = df.sort_values(by='ind').reset_index(drop=True)
                 df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
                 df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-                return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='ind', sub_ly=['cum_daily_ret_a'])
+                return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='ind', sub_ly=['cum_daily_ret_a'], title='sox_night')
             elif trading_session == 'day':
                 df = df.sort_values(by='ind').reset_index(drop=True)
                 df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
@@ -974,7 +1290,7 @@ class TXAnalyzer:
                 mean_l = df.loc[df['ind'] < 0.0025, 'daily_ret'].mean()
                 mean_r = df.loc[df['ind'] >= 0.0025, 'daily_ret'].mean()
                 print(f"SOX ind threshold=0.0025\nmean_l={mean_l:.6f} | mean_r={mean_r:.6f}")
-                return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
+                return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='sox_day')
         
         # # sub 1：SOX 優先
         # if sub_analysis:
@@ -1145,102 +1461,105 @@ class TXAnalyzer:
 
             return
 
-    def check_risk_events(self, filter_tech_signal: bool = False) -> pd.DataFrame:
-        """
-        檢查並列出觸發風控的所有日期與原因 (Risk Event Log)
-        
-        Args:
-            factors: 因子列表
-            filter_tech_signal: 是否只顯示 "技術面有訊號 (Strong Buy/Dip Buy) 但被風控擋掉" 的事件
-        """
-        df = self.df.copy()
-        
-        # 1. 計算指標
-        df = self._calculate_factors(df)
-        
-        events = []
-        
-        # Helper function
-        def add_event(date, factor_name, value, action, tech_val):
-            # 判斷技術面是否有訊號 (Layer 4 想要進場的條件)
-            # 1. Day Momentum: > 0.0045
-            # 2. Night Safe Trend: > 0.0035
-            # 只要 > 0.0035 就視為有技術面訊號
-            is_tech_signal = (tech_val > 0.0035)
-            
-            # 如果開啟過濾，且沒有技術訊號，則不加入
-            if filter_tech_signal and not is_tech_signal:
-                return
+    # Risk review and backtesting -------------------------------------------------
+    def evaluate(
+        self,
+        config: StrategyConfig | None = None,
+        *,
+        point_version: bool = False,
+        start: str | pd.Timestamp | None = None,
+        end: str | pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """Return a backtest result frame without rendering or writing an output file."""
+        result = self._build_backtest_frame(point_version=point_version, config=config)
+        if start is not None:
+            result = result.loc[result.index >= pd.Timestamp(start)]
+        if end is not None:
+            result = result.loc[result.index <= pd.Timestamp(end)]
+        return result
 
-            events.append({
-                'Date': date,
-                'Factor': factor_name,
-                'Value': value,
-                'Action': action,
-                'Tech_Signal': 'Buy' if is_tech_signal else 'Neutral',
-                'Divergence': tech_val
-            })
+    def summarize_result(
+        self,
+        result: pd.DataFrame,
+        *,
+        return_column: str = 'strat_ret',
+        point_version: bool = False,
+    ) -> pd.Series:
+        """Summarize an ``evaluate()`` result or an explicitly sliced validation period."""
+        if return_column not in result:
+            raise KeyError(f"result missing return column: {return_column}")
+        return pd.Series(self._calculate_metrics(result[return_column].copy(), point_version=point_version))
 
-        # --- Check Logic (Must match _apply_signals_logic) ---
-        
-        # A. 估值衝擊 (Yield Shock)
-        mask = df['yield_shock'] > 0.15
-        for date, val in df.loc[mask, 'yield_shock'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Yield Shock', val, 'Flat All (Shock > 0.15)', tech_val)
+    def _build_backtest_frame(
+        self,
+        point_version: bool,
+        config: StrategyConfig | None = None,
+    ) -> pd.DataFrame:
+        """Build the result frame without rendering charts or writing files."""
+        active_config = config or self.config
+        df = StrategyEngine.calculate_factors(self.df)
+        df = StrategyEngine.apply_positions(df, active_config)
 
-        # E. Holiday
-        mask = df['holiday'] > 2
-        for date, val in df.loc[mask, 'holiday'].items():
-            tech_val = df.loc[date, 'divergence']
-            add_event(date, 'Holiday', val, 'Flat All (Holiday > 2)', tech_val)
-
-        # F. Technical
-        mask = df['divergence'] < 0.0045 # Technical Exit
-        for date, val in df.loc[mask, 'divergence'].items():
-            add_event(date, 'Technical', val, 'Flat Day (Div < 0.0045)', val)
-
-        if not events:
-            return pd.DataFrame(columns=['Date', 'Factor', 'Value', 'Action', 'Tech_Signal', 'Divergence'])
-
-        res_df = pd.DataFrame(events)
-        res_df = res_df.sort_values(by='Date')
-        return res_df
-
-    def backtest(self, risk_log: bool = False, point_version: bool = False):
-        """
-        回測策略 (Backtest Strategy)
-        """
-        df = self.df.copy()
-
-        # 1. 指標計算 (Indicators Calculation)
-        df = self._calculate_factors(df)
-
-        # 2. 策略邏輯 (Strategy Logic)
-        df = self._apply_signals_logic(df)
-
-        # 3. 計算回測結果 (Backtest PnL)
         if point_version:
             df['daily_pnl_a'] = df['Open'] - df['Open_a']
             df['daily_pnl'] = df['Open_a'].shift(-1) - df['Open']
             df['strat_ret'] = (df['daily_pnl_a'] * df['pos_night']) + (df['daily_pnl'] * df['pos_day'])
-            df['benchmark_ret'] = (df['daily_pnl_a'] + df['daily_pnl'])
-            df['benchmark_ret'] = df['daily_pnl_a']
             df['benchmark_ret'] = df['daily_pnl']
-            y_label = "Points"
         else:
             df['daily_ret_a'] = (df['Open'] / df['Open_a']) - 1
             df['daily_ret'] = (df['Open_a'].shift(-1) / df['Open']) - 1
             df['strat_ret'] = (df['daily_ret_a'] * df['pos_night']) + (df['daily_ret'] * df['pos_day'])
-            df['benchmark_ret'] = (df['daily_ret_a'] + df['daily_ret'])
             df['benchmark_ret'] = df['daily_ret_a']
-            # df['benchmark_ret'] = df['daily_ret']
-            y_label = "Returns (%)"
 
         df['cum_strat'] = df['strat_ret'].cumsum()
         df['cum_bnh'] = df['benchmark_ret'].cumsum()
+        return df
 
-        df.to_csv('backtest.csv', index=True)
+    def check_risk_events(self, filter_tech_signal: bool = False) -> pd.DataFrame:
+        """Return a log that explains each active day-session position."""
+        df = StrategyEngine.apply_positions(StrategyEngine.calculate_factors(self.df), self.config)
+        move_below_threshold = df['MOVE_ind'] < self.config.move_threshold
+        foreign_option_bearish = df['Foreign_Opt_Signal_a'] < self.config.foreign_option_threshold
+        divergence_supports_long = df['divergence_v2'] < self.config.divergence_threshold
+
+        log = pd.DataFrame(index=df.index)
+        log['Factor'] = np.select(
+            [move_below_threshold, foreign_option_bearish, ~divergence_supports_long],
+            ['MOVE', 'Foreign option positioning', 'Day divergence'],
+            default='No active signal',
+        )
+        log['Value'] = np.select(
+            [move_below_threshold, foreign_option_bearish, ~divergence_supports_long],
+            [df['MOVE_ind'], df['Foreign_Opt_Signal_a'], df['divergence_v2']],
+            default=np.nan,
+        )
+        log['Action'] = np.select(
+            [df['pos_day'].gt(0), df['pos_day'].lt(0)],
+            ['Long day session', 'Short day session'],
+            default='Flat',
+        )
+        log['Tech_Signal'] = np.where(df['pos_day'].gt(0), 'Buy', 'Neutral')
+        log['Divergence'] = df['divergence_v2']
+        log.index.name = 'Date'
+        log = log.reset_index()
+
+        if filter_tech_signal:
+            log = log.loc[log['Action'].ne('Flat')]
+        return log
+
+    def backtest(
+        self,
+        risk_log: bool = False,
+        point_version: bool = False,
+        config: StrategyConfig | None = None,
+        start: str | pd.Timestamp | None = None,
+        end: str | pd.Timestamp | None = None,
+    ):
+        """Run the configured strategy, save the result frame, and display performance."""
+        df = self.evaluate(config=config, point_version=point_version, start=start, end=end)
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(OUTPUT_DIR / 'backtest.csv', index=True)
         # ===============================================================
         # 4. 顯示績效統計 (Performance Metrics)
         # ===============================================================
@@ -1306,7 +1625,7 @@ class TXAnalyzer:
         
         # 定義主要因子 (若未指定 fetch default)
         if factors is None:
-            factors = ['Foreign_Opt_Signal', 'skew_diff', 'divergence', 'holiday']
+            factors = ['Foreign_Opt_Signal_a', 'MOVE_ind', 'SOX_ind', 'divergence']
         
         # 移除沒有該 flag 的情形 (例如 holiday 需要計算)
         valid_factors = [f for f in factors if f in df.columns]
