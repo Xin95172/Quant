@@ -992,6 +992,105 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}ma_divergence')
 
+    def compare_ma_divergence_windows(
+        self,
+        windows: range | list[int] | tuple[int, ...],
+        *,
+        return_column: str = 'daily_ret',
+        threshold_map: dict[int, float] | None = None,
+        grid_points: int = 100,
+    ) -> pd.DataFrame:
+        """Compress the original divergence-sorted curves into one heatmap.
+
+        Each row is one MA window. Each cell is the original
+        ``cum_demeaned_daily_ret`` at that window's divergence percentile.
+        Hover to read the raw divergence at any cell. Pass manually observed
+        thresholds in ``threshold_map`` to mark them in red.
+        """
+
+        windows = list(windows)
+        if not windows or any(window < 2 for window in windows):
+            raise ValueError('windows must contain moving-average lengths of at least 2')
+        if return_column not in self.df:
+            raise KeyError(f"missing return column: {return_column}")
+        if grid_points < 20:
+            raise ValueError('grid_points must be at least 20')
+
+        threshold_map = threshold_map or {}
+        summary = []
+        heatmap_values = []
+        heatmap_divergence = []
+        percentiles = np.linspace(0, 100, grid_points)
+        fig = go.Figure()
+
+        for window in windows:
+            divergence = ((self.df['Close'] / self.df['Close'].rolling(window=window).mean()) - 1).shift(1)
+            frame = pd.DataFrame({'divergence': divergence, 'return': self.df[return_column]}).dropna()
+            if frame.empty:
+                summary.append({'window': window, 'observations': 0, 'minimum_cum_demeaned_return': np.nan, 'divergence_at_minimum': np.nan})
+                heatmap_values.append(np.full(grid_points, np.nan))
+                heatmap_divergence.append(np.full(grid_points, np.nan))
+                continue
+
+            frame = frame.sort_values('divergence').reset_index(drop=True)
+            frame['cum_demeaned_return'] = (frame['return'] - frame['return'].mean()).cumsum()
+            source_percentiles = np.linspace(0, 100, len(frame))
+            heatmap_values.append(np.interp(percentiles, source_percentiles, frame['cum_demeaned_return']))
+            heatmap_divergence.append(np.interp(percentiles, source_percentiles, frame['divergence']))
+            minimum = frame.loc[frame['cum_demeaned_return'].idxmin()]
+            summary.append({
+                'window': window,
+                'observations': len(frame),
+                'minimum_cum_demeaned_return': minimum['cum_demeaned_return'],
+                'divergence_at_minimum': minimum['divergence'],
+            })
+
+        fig.add_trace(
+            go.Heatmap(
+                x=percentiles,
+                y=windows,
+                z=np.asarray(heatmap_values),
+                customdata=np.asarray(heatmap_divergence),
+                colorscale='RdBu',
+                zmid=0,
+                colorbar=dict(title='Cumulative demeaned<br>daily return', tickformat='.1%'),
+                hovertemplate='MA window: %{y}<br>Divergence percentile: %{x:.1f}%<br>Raw divergence: %{customdata:.4%}<br>Cumulative demeaned daily return: %{z:.3%}<extra></extra>',
+            )
+        )
+        marker_x = []
+        marker_y = []
+        marker_text = []
+        for row, window in enumerate(windows):
+            if window not in threshold_map or not np.isfinite(heatmap_divergence[row]).any():
+                continue
+            threshold = threshold_map[window]
+            marker_x.append(np.interp(threshold, heatmap_divergence[row], percentiles))
+            marker_y.append(window)
+            marker_text.append(f'{window} MA threshold: {threshold:.4%}')
+        if marker_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=marker_x,
+                    y=marker_y,
+                    mode='markers',
+                    marker=dict(color='#111111', size=10, symbol='x'),
+                    text=marker_text,
+                    hovertemplate='%{text}<extra></extra>',
+                    name='observed threshold',
+                )
+            )
+        fig.update_layout(
+            title='MA divergence: cumulative demeaned daily return heatmap',
+            template='plotly_white',
+            height=620,
+            hovermode='closest',
+            showlegend=False,
+        )
+        fig.update_xaxes(title_text='Divergence percentile within each MA window', range=[0, 100])
+        fig.update_yaxes(title_text='MA window')
+        fig.show()
+        return pd.DataFrame(summary).set_index('window')
+
     def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
         df['3_ma'] = df['Close_a'].rolling(3).mean()
