@@ -1395,40 +1395,66 @@ class TXAnalyzer:
         volatility_window: int = 20,
         volatility_regime: int = 5,
         volatility_bins: int = 5,
-        divergence_percentile: float = 15,
+        divergence_percentile: float | tuple[float, float] = 15,
         return_column: str = 'daily_ret',
     ) -> pd.DataFrame:
-        """Plot when a selected divergence/volatility condition occurs over time.
+        """Plot when a selected divergence condition occurs over time.
 
         The divergence percentile is ranked within each volatility regime, the
-        same convention used by ``compare_ma_divergence_by_volatility``. The
-        returned frame contains only dates satisfying the selected condition.
+        same convention used by ``compare_ma_divergence_by_volatility``. Set
+        ``volatility_bins=1`` to skip the volatility condition and rank across
+        all valid dates. Pass ``divergence_percentile=(80, 100)`` to select a
+        closed percentile range instead of the default lower-tail cutoff. The
+        returned frame contains only signal dates.
         """
         from plotly.subplots import make_subplots
 
-        if ma_window < 2 or volatility_window < 2:
-            raise ValueError('ma_window and volatility_window must be at least 2')
+        if ma_window < 2:
+            raise ValueError('ma_window must be at least 2')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
-        if volatility_bins < 2:
-            raise ValueError('volatility_bins must be at least 2')
+        if volatility_bins < 1:
+            raise ValueError('volatility_bins must be at least 1')
+        if volatility_bins > 1 and volatility_window < 2:
+            raise ValueError('volatility_window must be at least 2 when using volatility bins')
         if not 1 <= volatility_regime <= volatility_bins:
             raise ValueError('volatility_regime must be between 1 and volatility_bins')
-        if not 0 < divergence_percentile <= 100:
-            raise ValueError('divergence_percentile must be greater than 0 and at most 100')
+        if isinstance(divergence_percentile, tuple):
+            if len(divergence_percentile) != 2:
+                raise ValueError('divergence_percentile range must contain exactly two values')
+            percentile_lower, percentile_upper = map(float, divergence_percentile)
+            if not 0 <= percentile_lower < percentile_upper <= 100:
+                raise ValueError('divergence_percentile range must satisfy 0 <= lower < upper <= 100')
+            percentile_label = f'{percentile_lower:g}% to {percentile_upper:g}%'
+        else:
+            percentile_lower = 0.0
+            percentile_upper = float(divergence_percentile)
+            if not 0 < percentile_upper <= 100:
+                raise ValueError('divergence_percentile must be greater than 0 and at most 100')
+            percentile_label = f'<= {percentile_upper:g}%'
 
         returns = self.df[return_column]
         divergence = ((self.df['Close'] / self.df['Close'].rolling(ma_window).mean()) - 1).shift(1)
-        realized_volatility = returns.rolling(volatility_window).std().shift(1)
-        frame = pd.DataFrame({'divergence': divergence, 'return': returns, 'volatility': realized_volatility}).dropna()
-        frame['volatility_group'] = pd.qcut(frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
-        if frame['volatility_group'].nunique() != volatility_bins:
-            raise ValueError(f'not enough volatility variation to create {volatility_bins} bins')
+        if volatility_bins == 1:
+            frame = pd.DataFrame({'divergence': divergence, 'return': returns}).dropna()
+            frame['volatility_group'] = 0
+            regime_label = 'without volatility regime'
+            customdata = np.column_stack((frame['divergence'],))
+            hovertemplate = 'Date: %{x|%Y-%m-%d}<br>daily_ret: %{y:.3%}<br>Raw divergence: %{customdata[0]:.4%}<br>Divergence percentile: %{text:.1f}%<extra></extra>'
+        else:
+            realized_volatility = returns.rolling(volatility_window).std().shift(1)
+            frame = pd.DataFrame({'divergence': divergence, 'return': returns, 'volatility': realized_volatility}).dropna()
+            frame['volatility_group'] = pd.qcut(frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
+            if frame['volatility_group'].nunique() != volatility_bins:
+                raise ValueError(f'not enough volatility variation to create {volatility_bins} bins')
+            regime_label = f'within Q{volatility_regime} volatility ({volatility_window}D)'
+            customdata = np.column_stack((frame['divergence'], frame['volatility']))
+            hovertemplate = 'Date: %{x|%Y-%m-%d}<br>daily_ret: %{y:.3%}<br>Raw divergence: %{customdata[0]:.4%}<br>Divergence percentile in regime: %{text:.1f}%<br>Prior volatility: %{customdata[1]:.3%}<extra></extra>'
 
         frame['divergence_percentile'] = frame.groupby('volatility_group')['divergence'].rank(method='first', pct=True) * 100
         events = frame.loc[
             frame['volatility_group'].eq(volatility_regime - 1)
-            & frame['divergence_percentile'].le(divergence_percentile)
+            & frame['divergence_percentile'].between(percentile_lower, percentile_upper, inclusive='both')
         ].copy()
         events.index.name = 'date'
 
@@ -1463,8 +1489,9 @@ class TXAnalyzer:
                     colorbar=dict(title='daily_ret', tickformat='.1%'),
                     line=dict(color='#222222', width=0.4),
                 ),
-                customdata=np.column_stack((events['divergence'], events['divergence_percentile'], events['volatility'])),
-                hovertemplate='Date: %{x|%Y-%m-%d}<br>daily_ret: %{y:.3%}<br>Raw divergence: %{customdata[0]:.4%}<br>Divergence percentile in regime: %{customdata[1]:.1f}%<br>Prior volatility: %{customdata[2]:.3%}<extra></extra>',
+                customdata=customdata[frame.index.get_indexer(events.index)],
+                text=events['divergence_percentile'],
+                hovertemplate=hovertemplate,
                 showlegend=False,
             ),
             row=1,
@@ -1487,8 +1514,8 @@ class TXAnalyzer:
         max_gap_text = 'n/a' if pd.isna(max_gap) else f'{max_gap:.0f} days'
         fig.update_layout(
             title=(
-                f'{ma_window}ma divergence <= {divergence_percentile:g}% within Q{volatility_regime} volatility '
-                f'({volatility_window}D): {len(events)} signal days | active months {active_months}/{len(monthly_count)} '
+                f'{ma_window}ma divergence {percentile_label} {regime_label}: '
+                f'{len(events)} signal days | active months {active_months}/{len(monthly_count)} '
                 f'| median gap {gap_text} | max gap {max_gap_text}'
             ),
             template='plotly_white',
