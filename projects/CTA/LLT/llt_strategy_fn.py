@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import talib as ta
 from talib import abstract
-import yfinance as yfin
 from arch import arch_model
 import quantstats
 

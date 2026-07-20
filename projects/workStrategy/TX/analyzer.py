@@ -7,6 +7,7 @@ import pandas as pd
 import module.plot_func as plot
 import plotly.graph_objects as go
 from IPython.display import display
+from module.data_gateway import DataGateway
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -85,31 +86,42 @@ class StrategyEngine:
 class TXAnalyzer:
     """Notebook-facing facade for TX features, diagnostics, and backtesting."""
 
-    # Construction and core state -------------------------------------------------
+    # =========================================================================
+    # Construction and session preprocessing
+    # =========================================================================
     def __init__(self, df: pd.DataFrame, config: StrategyConfig | None = None):
         self.config = config or StrategyConfig()
-        df = df.copy()
-        df.index = pd.to_datetime(df.index).normalize()
-        df_day = df[df['trading_session'] == 'position'].copy()
-        df_night = df[df['trading_session'] == 'after_market'].copy()
+        self.df = self._prepare_session_frame(df)
+        self._add_session_return_columns()
 
-        if df_day.index.duplicated().any() or df_night.index.duplicated().any():
+    @staticmethod
+    def _prepare_session_frame(df: pd.DataFrame) -> pd.DataFrame:
+        """Pair day and night rows by their normalized close date."""
+        frame = df.copy()
+        frame.index = pd.to_datetime(frame.index).normalize()
+        day_frame = frame.loc[frame['trading_session'].eq('position')].copy()
+        night_frame = frame.loc[frame['trading_session'].eq('after_market')].copy()
+
+        if day_frame.index.duplicated().any() or night_frame.index.duplicated().any():
             raise ValueError('each trading session must contain at most one row per close date')
-            
-        df_night = df_night.add_suffix('_a')
-            
-        self.df = pd.concat([df_day, df_night], axis=1)
+
+        return pd.concat([day_frame, night_frame.add_suffix('_a')], axis=1)
+
+    def _add_session_return_columns(self) -> None:
+        """Add day/night return, cumulative return, PnL, and cumulative PnL columns."""
+        for suffix in ('', '_a'):
+            open_column = f'Open{suffix}'
+            close_column = f'Close{suffix}'
+            return_column = f'daily_ret{suffix}'
+            pnl_column = f'daily_pnl{suffix}'
+            self.df[return_column] = (self.df[close_column] / self.df[open_column]) - 1
+            self.df[f'cum_{return_column}'] = self.df[return_column].cumsum()
+            self.df[pnl_column] = self.df[close_column] - self.df[open_column]
+            self.df[f'cum_{pnl_column}'] = self.df[pnl_column].cumsum()
     
-        self.df['daily_ret'] = (self.df['Close'] / self.df['Open']) - 1
-        self.df['cum_daily_ret'] = self.df['daily_ret'].cumsum()
-        self.df['daily_pnl'] = self.df['Close'] - self.df['Open']
-        self.df['cum_daily_pnl'] = self.df['daily_pnl'].cumsum()
-        
-        self.df['daily_ret_a'] = (self.df['Close_a'] / self.df['Open_a']) - 1
-        self.df['cum_daily_ret_a'] = self.df['daily_ret_a'].cumsum()
-        self.df['daily_pnl_a'] = self.df['Close_a'] - self.df['Open_a']
-        self.df['cum_daily_pnl_a'] = self.df['daily_pnl_a'].cumsum()
-    
+    # =========================================================================
+    # Configuration, data views, and summary helpers
+    # =========================================================================
     def _get_statistics(self, ret_col: pd.Series) -> pd.Series:
         return ret_col.describe()
 
@@ -313,7 +325,9 @@ class TXAnalyzer:
         self.df = df
         return self.df
 
-    # Feature pipeline ------------------------------------------------------------
+    # =========================================================================
+    # Feature ingestion and normalization
+    # =========================================================================
     def merge_features(self, features: pd.DataFrame) -> pd.DataFrame:
         """Left-join date-indexed features onto the strategy frame."""
         features = features.copy()
@@ -497,28 +511,44 @@ class TXAnalyzer:
         """Fetch the current CNN Fear & Greed history in a stable tabular shape."""
         import requests
 
-        response = requests.get(
-            'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
-            headers={
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/122.0 Safari/537.36'
-                )
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        history = response.json().get('fear_and_greed_historical', {}).get('data', [])
-        if not history:
-            return pd.DataFrame(columns=['date', 'score', 'rating'])
+        def fetch_remote(
+            _start: str | None,
+            _end: str | None,
+        ) -> pd.DataFrame:
+            response = requests.get(
+                'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
+                headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/122.0 Safari/537.36'
+                    )
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            history = response.json().get(
+                'fear_and_greed_historical', {}
+            ).get('data', [])
+            if not history:
+                return pd.DataFrame(columns=['date', 'score', 'rating'])
 
-        fear_greed = pd.DataFrame(history)
-        fear_greed['date'] = pd.to_datetime(fear_greed['x'], unit='ms')
-        return (
-            fear_greed.rename(columns={'y': 'score'})[['date', 'score', 'rating']]
-            .sort_values('date')
-            .reset_index(drop=True)
+            fear_greed = pd.DataFrame(history)
+            fear_greed['date'] = pd.to_datetime(fear_greed['x'], unit='ms')
+            return (
+                fear_greed.rename(columns={'y': 'score'})[
+                    ['date', 'score', 'rating']
+                ]
+                .sort_values('date')
+                .reset_index(drop=True)
+            )
+
+        today = pd.Timestamp.now().normalize().strftime('%Y-%m-%d')
+        return DataGateway("cnn").fetch_frame(
+            dataset="fear_and_greed",
+            fetcher=fetch_remote,
+            start_date="1900-01-01",
+            end_date=today,
         )
 
     def add_fear_greed(self, historical_df: pd.DataFrame, latest_df: pd.DataFrame) -> pd.DataFrame:
@@ -570,7 +600,9 @@ class TXAnalyzer:
             })
         return pd.DataFrame(status).set_index('feature')
 
-    # Performance summaries -------------------------------------------------------
+    # =========================================================================
+    # Return and calendar summaries
+    # =========================================================================
     def daily_ret(self):
         return plot.plot(self.df, ly=['cum_daily_ret', 'cum_daily_ret_a'], title='daily_return')
 
@@ -662,7 +694,9 @@ class TXAnalyzer:
         
         fig.show()
 
-    # Factor diagnostics ----------------------------------------------------------
+    # =========================================================================
+    # Factor diagnostics: position and calendar
+    # =========================================================================
     def indicator_position_ret(self):
         df = self.df.copy()
         df['ind'] = df['daily_ret'].shift(1) + df['daily_ret_a'].shift(1) + df['daily_ret'].shift(2)
@@ -725,6 +759,9 @@ class TXAnalyzer:
         period = 'after_holiday' if after_holiday else 'before_holiday'
         return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'gap_days_{period}')
 
+    # =========================================================================
+    # Factor diagnostics: margin and options
+    # =========================================================================
     def indicator_maintenance_rate(self, point_version: bool = False):
         if 'TotalExchangeMarginMaintenance' not in self.df.columns:
             raise ValueError("TotalExchangeMarginMaintenance is not in the DataFrame.")
@@ -802,6 +839,9 @@ class TXAnalyzer:
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='pos_continue', sub_ly=['cum_daily_ret_a'], title=f'option_position_night_{indicator}')
 
+    # =========================================================================
+    # Factor diagnostics: volatility, flows, and MA divergence
+    # =========================================================================
     def check_volatility(self, window: int = 20):
         """
         事件變數 + 事件前 window 天波動度分佈（PDF）
@@ -976,7 +1016,7 @@ class TXAnalyzer:
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='foreign_inflow', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'])
 
-    def indicator_15ma_divergence(self, window: int = 15):
+    def indicator_ma_divergence(self, window: int = 15):
         temp_df = self.df.copy()
         temp_df[f'{window}_ma'] = temp_df['Close'].rolling(window=window).mean()
         temp_df['divergence'] = (temp_df['Close'] / temp_df[f'{window}_ma']) - 1
@@ -998,8 +1038,6 @@ class TXAnalyzer:
         *,
         return_column: str = 'daily_ret',
         demean_return: bool = True,
-        volatility_window: int | None = None,
-        volatility_bins: int = 5,
         threshold_map: dict[int, float] | None = None,
         bin_percentile: float = 5,
     ) -> pd.DataFrame:
@@ -1007,8 +1045,6 @@ class TXAnalyzer:
 
         Each row is one MA window. Each cell is the mean return in a
         divergence-percentile bin. Set ``demean_return=False`` for raw returns.
-        With ``volatility_window``, returns are first neutralized within
-        quantiles of the preceding realized volatility, without look-ahead.
         Hover to read the raw divergence at any cell. Pass manually observed
         thresholds in ``threshold_map`` to mark them in red.
         """
@@ -1020,25 +1056,11 @@ class TXAnalyzer:
             raise KeyError(f"missing return column: {return_column}")
         if not 0 < bin_percentile <= 25:
             raise ValueError('bin_percentile must be greater than 0 and at most 25')
-        if volatility_window is not None and volatility_window < 2:
-            raise ValueError('volatility_window must be at least 2')
-        if volatility_bins < 2:
-            raise ValueError('volatility_bins must be at least 2')
 
         threshold_map = threshold_map or {}
         analysis_return = self.df[return_column].copy()
-        if volatility_window is not None:
-            realized_volatility = analysis_return.rolling(volatility_window).std().shift(1)
-            volatility_frame = pd.DataFrame({'return': analysis_return, 'volatility': realized_volatility}).dropna()
-            volatility_bucket = pd.qcut(volatility_frame['volatility'], q=volatility_bins, duplicates='drop')
-            if volatility_bucket.nunique() < 2:
-                raise ValueError('not enough volatility variation to create volatility bins')
-            volatility_frame['return'] = volatility_frame['return'] - volatility_frame.groupby(volatility_bucket, observed=True)['return'].transform('mean')
-            analysis_return = volatility_frame['return'].reindex(self.df.index)
 
         value_label = f'Demeaned {return_column}' if demean_return else return_column
-        if volatility_window is not None:
-            value_label = f'Volatility-controlled {value_label} ({volatility_window}D, {volatility_bins} bins)'
         value_title = value_label.replace(' ', '_')
         summary = []
         heatmap_values = []
@@ -1164,6 +1186,8 @@ class TXAnalyzer:
         regime_labels[-1] += ' high vol'
         column_labels = [f'{regime}\n{bin_label}' for regime in regime_labels for bin_label in bin_labels]
         mean_returns = np.full((len(windows), len(column_labels)), np.nan)
+        median_returns = np.full((len(windows), len(column_labels)), np.nan)
+        neg_ratios = np.full((len(windows), len(column_labels)), np.nan)
         mean_divergence = np.full((len(windows), len(column_labels)), np.nan)
         observations = np.zeros((len(windows), len(column_labels)), dtype=int)
 
@@ -1179,10 +1203,12 @@ class TXAnalyzer:
                     column = group * len(bin_labels) + bin_index
                     values = regime.loc[(regime['divergence_percentile'] > lower) & (regime['divergence_percentile'] <= upper)]
                     mean_returns[row, column] = values['return'].mean()
+                    median_returns[row, column] = values['return'].median()
+                    neg_ratios[row, column] = (values['return'] < 0).mean() if len(values) > 0 else np.nan
                     mean_divergence[row, column] = values['divergence'].mean()
                     observations[row, column] = len(values)
 
-        customdata = np.stack((mean_divergence, observations), axis=-1)
+        customdata = np.stack((mean_divergence, observations, median_returns, neg_ratios), axis=-1)
         column_positions = np.arange(len(column_labels))
         fig = go.Figure(
             go.Heatmap(
@@ -1196,7 +1222,15 @@ class TXAnalyzer:
                 xgap=1,
                 ygap=1,
                 colorbar=dict(title=f'Mean<br>{return_column}', tickformat='.1%'),
-                hovertemplate='MA window: %{y}<br>%{text}<br>Mean raw divergence: %{customdata[0]:.4%}<br>Mean daily return: %{z:.3%}<br>Observations: %{customdata[1]}<extra></extra>',
+                hovertemplate=(
+                    'MA window: %{y}<br>%{text}<br>'
+                    'Mean raw divergence: %{customdata[0]:.4%}<br>'
+                    'Mean daily return: %{z:.3%}<br>'
+                    'Median daily return: %{customdata[2]:.3%}<br>'
+                    'P(ret < 0): %{customdata[3]:.1%}<br>'
+                    'Observations: %{customdata[1]}'
+                    '<extra></extra>'
+                ),
             )
         )
         for group in range(1, group_count):
@@ -1214,10 +1248,24 @@ class TXAnalyzer:
             tickangle=-45,
         )
         fig.update_yaxes(title_text='MA window')
-        columns = pd.MultiIndex.from_product([regime_labels, bin_labels], names=['volatility_regime', 'divergence_percentile_bin'])
+        bin_columns = pd.MultiIndex.from_product([regime_labels, bin_labels], names=['volatility_regime', 'divergence_percentile_bin'])
         fig.show()
-        return pd.DataFrame(mean_returns, index=windows, columns=columns)
+        report = pd.concat(
+            {
+                'mean': pd.DataFrame(mean_returns, index=windows, columns=bin_columns),
+                'median': pd.DataFrame(median_returns, index=windows, columns=bin_columns),
+                'P(ret<0)': pd.DataFrame(neg_ratios, index=windows, columns=bin_columns),
+                'observations': pd.DataFrame(observations, index=windows, columns=bin_columns),
+            },
+            axis=1,
+            names=['metric'],
+        )
+        report.index.name = 'MA_window'
+        return report
 
+    # =========================================================================
+    # Factor diagnostics: price structure and macro markets
+    # =========================================================================
     def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
         df['3_ma'] = df['Close_a'].rolling(3).mean()
@@ -1687,7 +1735,9 @@ class TXAnalyzer:
 
             return
 
-    # Risk review and backtesting -------------------------------------------------
+    # =========================================================================
+    # Strategy evaluation, risk review, and backtesting
+    # =========================================================================
     def evaluate(
         self,
         config: StrategyConfig | None = None,
@@ -1838,6 +1888,9 @@ class TXAnalyzer:
 
         return plot.plot(df, ly=['cum_strat', 'cum_bnh'], ry_dashed=False)
 
+    # =========================================================================
+    # Distribution and robustness views
+    # =========================================================================
     def show_factor_distributions(self, factors: list = None):
         """
         顯示策略使用之各項指標因子分佈情形 (Histograms & Statistics)

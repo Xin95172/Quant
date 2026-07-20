@@ -21,7 +21,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from FinMind.data import DataLoader
 
 # ── 設定 ──
 API_TOKEN = (
@@ -49,6 +48,15 @@ if _QUANT_DIR is not None:
     OUTPUT_DIR = TW_STOCK_KBAR_1MIN
 else:
     OUTPUT_DIR = _SCRIPT_DIR / "kbar" / "1min"
+
+_NOTE_DIR = (
+    _QUANT_DIR.parent / "note"
+    if _QUANT_DIR is not None
+    else Path("/Users/xinc/GitHub/note")
+)
+sys.path.insert(0, str(_NOTE_DIR))
+from module.get_info_FinMind import FinMindClient, FinMindConfig
+
 PROGRESS_FILE = OUTPUT_DIR / "progress.json"
 
 START_DATE = "2019-01-01"
@@ -93,7 +101,7 @@ def save_progress(completed: set[str]):
         json.dump({"completed_dates": sorted(completed)}, f, ensure_ascii=False)
 
 
-def get_stock_ids(dl: DataLoader) -> list[str]:
+def get_stock_ids(dl: FinMindClient) -> list[str]:
     """取得有效的台股股票代號清單（排除大盤/指數等）"""
     info = dl.taiwan_stock_info()
     info = info[info["type"].isin(["twse", "tpex"])]
@@ -103,7 +111,7 @@ def get_stock_ids(dl: DataLoader) -> list[str]:
     return sorted(info["stock_id"].unique().tolist())
 
 
-def get_trading_dates(dl: DataLoader, start: str, end: str) -> list[str]:
+def get_trading_dates(dl: FinMindClient, start: str, end: str) -> list[str]:
     """取得交易日列表"""
     df = dl.get_data(
         dataset="TaiwanStockTradingDate",
@@ -123,8 +131,7 @@ def main():
     logger.info("=" * 60)
 
     # 初始化 FinMind
-    dl = DataLoader()
-    dl.login_by_token(api_token=API_TOKEN)
+    dl = FinMindClient(FinMindConfig(api_token=API_TOKEN))
 
     # 股票清單
     logger.info("取得股票清單...")
@@ -150,6 +157,11 @@ def main():
     for idx, date_str in enumerate(remaining):
         out_file = OUTPUT_DIR / f"{date_str}.parquet"
         logger.info(f"[{idx+1}/{len(remaining)}] {date_str} ...")
+        if out_file.exists():
+            logger.info("  local parquet already exists")
+            completed.add(date_str)
+            save_progress(completed)
+            continue
 
         retries = 0
         success = False
