@@ -998,6 +998,8 @@ class TXAnalyzer:
         *,
         return_column: str = 'daily_ret',
         demean_return: bool = True,
+        volatility_window: int | None = None,
+        volatility_bins: int = 5,
         threshold_map: dict[int, float] | None = None,
         bin_percentile: float = 5,
     ) -> pd.DataFrame:
@@ -1005,6 +1007,8 @@ class TXAnalyzer:
 
         Each row is one MA window. Each cell is the mean return in a
         divergence-percentile bin. Set ``demean_return=False`` for raw returns.
+        With ``volatility_window``, returns are first neutralized within
+        quantiles of the preceding realized volatility, without look-ahead.
         Hover to read the raw divergence at any cell. Pass manually observed
         thresholds in ``threshold_map`` to mark them in red.
         """
@@ -1016,9 +1020,25 @@ class TXAnalyzer:
             raise KeyError(f"missing return column: {return_column}")
         if not 0 < bin_percentile <= 25:
             raise ValueError('bin_percentile must be greater than 0 and at most 25')
+        if volatility_window is not None and volatility_window < 2:
+            raise ValueError('volatility_window must be at least 2')
+        if volatility_bins < 2:
+            raise ValueError('volatility_bins must be at least 2')
 
         threshold_map = threshold_map or {}
+        analysis_return = self.df[return_column].copy()
+        if volatility_window is not None:
+            realized_volatility = analysis_return.rolling(volatility_window).std().shift(1)
+            volatility_frame = pd.DataFrame({'return': analysis_return, 'volatility': realized_volatility}).dropna()
+            volatility_bucket = pd.qcut(volatility_frame['volatility'], q=volatility_bins, duplicates='drop')
+            if volatility_bucket.nunique() < 2:
+                raise ValueError('not enough volatility variation to create volatility bins')
+            volatility_frame['return'] = volatility_frame['return'] - volatility_frame.groupby(volatility_bucket, observed=True)['return'].transform('mean')
+            analysis_return = volatility_frame['return'].reindex(self.df.index)
+
         value_label = f'Demeaned {return_column}' if demean_return else return_column
+        if volatility_window is not None:
+            value_label = f'Volatility-controlled {value_label} ({volatility_window}D, {volatility_bins} bins)'
         value_title = value_label.replace(' ', '_')
         summary = []
         heatmap_values = []
@@ -1030,7 +1050,7 @@ class TXAnalyzer:
 
         for window in windows:
             divergence = ((self.df['Close'] / self.df['Close'].rolling(window=window).mean()) - 1).shift(1)
-            frame = pd.DataFrame({'divergence': divergence, 'return': self.df[return_column]}).dropna()
+            frame = pd.DataFrame({'divergence': divergence, 'return': analysis_return}).dropna()
             if frame.empty:
                 summary.append({'window': window, 'observations': 0, 'minimum_return': np.nan, 'divergence_at_minimum': np.nan})
                 heatmap_values.append(np.full(len(percentiles), np.nan))
@@ -1101,6 +1121,102 @@ class TXAnalyzer:
         fig.update_xaxes(title_text='Divergence percentile within each MA window', range=[0, 100])
         fig.update_yaxes(title_text='MA window')
         fig.show()
+
+    def compare_ma_divergence_by_volatility(
+        self,
+        windows: range | list[int] | tuple[int, ...],
+        *,
+        return_column: str = 'daily_ret',
+        volatility_window: int = 20,
+        volatility_bins: int = 5,
+        divergence_bin_percentile: float = 20,
+    ) -> pd.DataFrame:
+        """Compare every MA window, volatility regime, and divergence bin in one heatmap.
+
+        Rows are MA windows. Columns are volatility regimes, each split into
+        divergence-percentile bins ranked within that regime. Volatility uses
+        only preceding returns, avoiding look-ahead.
+        """
+        windows = list(windows)
+        if not windows or any(window < 2 for window in windows):
+            raise ValueError('windows must contain moving-average lengths of at least 2')
+        if return_column not in self.df:
+            raise KeyError(f"missing return column: {return_column}")
+        if volatility_window < 2:
+            raise ValueError('volatility_window must be at least 2')
+        if volatility_bins < 2:
+            raise ValueError('volatility_bins must be at least 2')
+        if not 0 < divergence_bin_percentile <= 50:
+            raise ValueError('divergence_bin_percentile must be greater than 0 and at most 50')
+
+        returns = self.df[return_column]
+        realized_volatility = returns.rolling(volatility_window).std().shift(1)
+        volatility_frame = pd.DataFrame({'return': returns, 'volatility': realized_volatility}).dropna()
+        volatility_frame['volatility_group'] = pd.qcut(volatility_frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
+        group_count = int(volatility_frame['volatility_group'].nunique())
+        if group_count < 2:
+            raise ValueError('not enough volatility variation to create volatility bins')
+
+        bin_edges = np.append(np.arange(0, 100, divergence_bin_percentile), 100.0)
+        bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
+        regime_labels = [f'Q{group + 1}' for group in range(group_count)]
+        regime_labels[0] += ' low vol'
+        regime_labels[-1] += ' high vol'
+        column_labels = [f'{regime}\n{bin_label}' for regime in regime_labels for bin_label in bin_labels]
+        mean_returns = np.full((len(windows), len(column_labels)), np.nan)
+        mean_divergence = np.full((len(windows), len(column_labels)), np.nan)
+        observations = np.zeros((len(windows), len(column_labels)), dtype=int)
+
+        for row, window in enumerate(windows):
+            divergence = ((self.df['Close'] / self.df['Close'].rolling(window=window).mean()) - 1).shift(1)
+            frame = pd.DataFrame({'divergence': divergence}).join(volatility_frame).dropna()
+            for group in range(group_count):
+                regime = frame.loc[frame['volatility_group'] == group].copy()
+                if regime.empty:
+                    continue
+                regime['divergence_percentile'] = regime['divergence'].rank(method='first') / len(regime) * 100
+                for bin_index, (lower, upper) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+                    column = group * len(bin_labels) + bin_index
+                    values = regime.loc[(regime['divergence_percentile'] > lower) & (regime['divergence_percentile'] <= upper)]
+                    mean_returns[row, column] = values['return'].mean()
+                    mean_divergence[row, column] = values['divergence'].mean()
+                    observations[row, column] = len(values)
+
+        customdata = np.stack((mean_divergence, observations), axis=-1)
+        column_positions = np.arange(len(column_labels))
+        fig = go.Figure(
+            go.Heatmap(
+                x=column_positions,
+                y=windows,
+                z=mean_returns,
+                customdata=customdata,
+                text=np.tile(column_labels, (len(windows), 1)),
+                colorscale='RdBu',
+                zmid=0,
+                xgap=1,
+                ygap=1,
+                colorbar=dict(title=f'Mean<br>{return_column}', tickformat='.1%'),
+                hovertemplate='MA window: %{y}<br>%{text}<br>Mean raw divergence: %{customdata[0]:.4%}<br>Mean daily return: %{z:.3%}<br>Observations: %{customdata[1]}<extra></extra>',
+            )
+        )
+        for group in range(1, group_count):
+            fig.add_vline(x=group * len(bin_labels) - 0.5, line_color='#555555', line_width=1)
+        fig.update_layout(
+            title='MA divergence: daily_ret by volatility regime',
+            template='plotly_white',
+            height=max(650, len(windows) * 18 + 220),
+        )
+        fig.update_xaxes(
+            title_text='Volatility regime / divergence percentile bin',
+            tickmode='array',
+            tickvals=column_positions,
+            ticktext=column_labels,
+            tickangle=-45,
+        )
+        fig.update_yaxes(title_text='MA window')
+        columns = pd.MultiIndex.from_product([regime_labels, bin_labels], names=['volatility_regime', 'divergence_percentile_bin'])
+        fig.show()
+        return pd.DataFrame(mean_returns, index=windows, columns=columns)
 
     def indicator_night_price(self, sub_analysis=False):
         df = self.df.copy()
