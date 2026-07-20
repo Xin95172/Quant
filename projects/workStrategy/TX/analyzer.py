@@ -125,6 +125,23 @@ class TXAnalyzer:
     def _get_statistics(self, ret_col: pd.Series) -> pd.Series:
         return ret_col.describe()
 
+    @staticmethod
+    def _percentile_value(values: pd.Series, percentile: float, side: str) -> float:
+        """Return a raw lower or upper percentile value from a non-empty series."""
+        if not 0 < percentile <= 100:
+            raise ValueError('percentile must be greater than 0 and at most 100')
+        if side not in {'low', 'high'}:
+            raise ValueError("side must be either 'low' or 'high'")
+
+        clean_values = values.dropna()
+        if clean_values.empty:
+            raise ValueError('no valid observations are available for this percentile')
+
+        quantile = percentile / 100
+        if side == 'high':
+            quantile = 1 - quantile
+        return float(clean_values.quantile(quantile))
+
     def set_config(self, config: StrategyConfig) -> None:
         """Replace the active strategy configuration for subsequent analysis and backtests."""
         self.config = config
@@ -132,8 +149,10 @@ class TXAnalyzer:
     def session_alignment_report(self) -> pd.Series:
         """Check day and night session pairing under the close-date convention.
 
-        The night session labeled ``D`` is expected to close before the day session
-        labeled ``D`` opens, so both must share the same normalized date.
+        The night session labeled ``D`` closes before the day session labeled
+        ``D`` opens, so every available day session must have a same-date night
+        session. A night-only date can occur when the following day session is
+        cancelled, for example because of a typhoon closure.
         """
         day_available = self.df[['Open', 'Close']].notna().all(axis=1)
         night_available = self.df[['Open_a', 'Close_a']].notna().all(axis=1)
@@ -145,7 +164,10 @@ class TXAnalyzer:
             'night_only_dates': int((~day_available & night_available).sum()),
             'missing_both_dates': int((~day_available & ~night_available).sum()),
             'duplicate_dates': int(self.df.index.duplicated().sum()),
-            'close_date_alignment_ok': bool(paired.all() and not self.df.index.duplicated().any()),
+            'close_date_alignment_ok': bool(
+                not (day_available & ~night_available).any()
+                and not self.df.index.duplicated().any()
+            ),
         }, name='session_alignment')
 
     def for_period(
@@ -1016,12 +1038,60 @@ class TXAnalyzer:
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='foreign_inflow', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'])
 
-    def indicator_ma_divergence(self, window: int = 15):
+    def indicator_ma_divergence(
+        self,
+        window: int = 15,
+        *,
+        percentile: float | None = None,
+        side: str = 'low',
+        volatility_window: int | None = None,
+        volatility_regime: int | None = None,
+        volatility_bins: int = 5,
+    ):
+        """Plot MA divergence, or return its raw percentile threshold.
+
+        When ``percentile`` is provided, the method returns a float instead of
+        plotting. Optionally pass a historical-volatility window and regime to
+        calculate the divergence threshold only inside that volatility group.
+        """
+        if window < 2:
+            raise ValueError('window must be at least 2')
+        has_volatility_condition = volatility_window is not None or volatility_regime is not None
+        if has_volatility_condition and (volatility_window is None or volatility_regime is None):
+            raise ValueError('volatility_window and volatility_regime must be provided together')
+        if volatility_window is not None and volatility_window < 2:
+            raise ValueError('volatility_window must be at least 2')
+        if volatility_regime is not None and not 1 <= volatility_regime <= volatility_bins:
+            raise ValueError('volatility_regime must be between 1 and volatility_bins')
+        if volatility_bins < 2:
+            raise ValueError('volatility_bins must be at least 2')
+
         temp_df = self.df.copy()
         temp_df[f'{window}_ma'] = temp_df['Close'].rolling(window=window).mean()
         temp_df['divergence'] = (temp_df['Close'] / temp_df[f'{window}_ma']) - 1
         temp_df['divergence'] = temp_df['divergence'].shift(1)
         temp_df = temp_df.dropna(subset=['divergence'])
+
+        if percentile is not None:
+            divergence = temp_df['divergence']
+            if has_volatility_condition:
+                temp_df['hist_vol'] = self.df['daily_ret'].rolling(volatility_window).std().shift(1)
+                temp_df = temp_df.dropna(subset=['hist_vol'])
+                try:
+                    temp_df['volatility_regime'] = pd.qcut(
+                        temp_df['hist_vol'],
+                        q=volatility_bins,
+                        labels=False,
+                        duplicates='raise',
+                    ) + 1
+                except ValueError as error:
+                    raise ValueError('volatility data cannot be split into the requested bins') from error
+                divergence = temp_df.loc[
+                    temp_df['volatility_regime'].eq(volatility_regime),
+                    'divergence',
+                ]
+            return self._percentile_value(divergence, percentile, side)
+
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
 
@@ -1031,6 +1101,36 @@ class TXAnalyzer:
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}ma_divergence')
+
+    # Kept for existing notebook cells written before the indicator was renamed.
+    indicator_15ma_divergence = indicator_ma_divergence
+
+    def indicator_hist_vol(
+        self,
+        window: int = 20,
+        *,
+        percentile: float | None = None,
+        side: str = 'low',
+    ):
+        """Plot historical volatility, or return its raw percentile threshold."""
+        if window < 2:
+            raise ValueError('window must be at least 2')
+        temp_df = self.df.copy()
+        temp_df['hist_vol'] = temp_df['daily_ret'].rolling(window=window).std()
+        temp_df['hist_vol'] = temp_df['hist_vol'].shift(1)
+        temp_df = temp_df.dropna(subset=['hist_vol'])
+        if percentile is not None:
+            return self._percentile_value(temp_df['hist_vol'], percentile, side)
+
+        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+        temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+
+        temp_df = temp_df.sort_values(by='hist_vol').reset_index(drop=True)
+        temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
+        temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='hist_vol', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}d_hist_vol')
 
     def compare_ma_divergence_windows(
         self,
@@ -1396,6 +1496,198 @@ class TXAnalyzer:
         )
         fig.update_yaxes(title_text='daily_ret', tickformat='.2%', row=1, col=1)
         fig.update_yaxes(title_text='Signal days', row=2, col=1)
+        fig.update_xaxes(title_text='Date', row=2, col=1)
+        fig.show()
+        return events
+
+    def show_divergence_signal_overlap(
+        self,
+        signal_configs: list[dict[str, int | float]],
+        *,
+        return_column: str = 'daily_ret',
+    ) -> pd.DataFrame:
+        """Show date overlap across complete divergence/volatility signal settings.
+
+        Each configuration accepts ``ma_window``, ``volatility_window``,
+        ``volatility_regime``, ``volatility_bins``, and
+        ``divergence_percentile``. Every configuration must trigger for a date
+        to appear in the returned overlap frame.
+        """
+        from plotly.subplots import make_subplots
+
+        if len(signal_configs) < 2:
+            raise ValueError('signal_configs must contain at least two configurations')
+        if return_column not in self.df:
+            raise KeyError(f"missing return column: {return_column}")
+
+        signals = pd.DataFrame(index=self.df.index)
+        details = pd.DataFrame(index=self.df.index)
+        labels = []
+        configs = []
+        for position, raw_config in enumerate(signal_configs, start=1):
+            allowed_keys = {'ma_window', 'volatility_window', 'volatility_regime', 'volatility_bins', 'divergence_percentile'}
+            unknown_keys = set(raw_config) - allowed_keys
+            if unknown_keys:
+                raise ValueError(f'unknown signal configuration keys: {sorted(unknown_keys)}')
+            config = {
+                'ma_window': int(raw_config.get('ma_window', 30)),
+                'volatility_window': int(raw_config.get('volatility_window', 20)),
+                'volatility_regime': int(raw_config.get('volatility_regime', 5)),
+                'volatility_bins': int(raw_config.get('volatility_bins', 5)),
+                'divergence_percentile': float(raw_config.get('divergence_percentile', 15)),
+            }
+            if config['ma_window'] < 2 or config['volatility_window'] < 2:
+                raise ValueError('ma_window and volatility_window must be at least 2')
+            if config['volatility_bins'] < 2 or not 1 <= config['volatility_regime'] <= config['volatility_bins']:
+                raise ValueError('volatility_regime must be between 1 and volatility_bins')
+            if not 0 < config['divergence_percentile'] <= 100:
+                raise ValueError('divergence_percentile must be greater than 0 and at most 100')
+
+            divergence = ((self.df['Close'] / self.df['Close'].rolling(config['ma_window']).mean()) - 1).shift(1)
+            volatility = self.df[return_column].rolling(config['volatility_window']).std().shift(1)
+            frame = pd.DataFrame({'divergence': divergence, 'volatility': volatility}).dropna()
+            frame['volatility_group'] = pd.qcut(frame['volatility'], q=config['volatility_bins'], labels=False, duplicates='drop')
+            if frame['volatility_group'].nunique() != config['volatility_bins']:
+                raise ValueError(f"not enough volatility variation to create {config['volatility_bins']} bins for configuration {position}")
+            frame['divergence_percentile'] = frame.groupby('volatility_group')['divergence'].rank(method='first', pct=True) * 100
+            signal = (
+                frame['volatility_group'].eq(config['volatility_regime'] - 1)
+                & frame['divergence_percentile'].le(config['divergence_percentile'])
+            )
+            label = (
+                f"MA{config['ma_window']} / vol{config['volatility_window']}D / "
+                f"Q{config['volatility_regime']} / div<={config['divergence_percentile']:g}%"
+            )
+            signals[label] = signal.reindex(signals.index, fill_value=False)
+            details[f'raw_divergence_{position}'] = frame['divergence']
+            details[f'volatility_{position}'] = frame['volatility']
+            details[f'divergence_percentile_{position}'] = frame['divergence_percentile']
+            labels.append(label)
+            configs.append(config)
+
+        signals['overlap'] = signals[labels].all(axis=1)
+        events = pd.concat([self.df[[return_column]], signals, details], axis=1).loc[signals['overlap']].copy()
+        events.index.name = 'date'
+
+        monthly_index = pd.date_range(self.df.index.min().to_period('M').to_timestamp(), self.df.index.max().to_period('M').to_timestamp(), freq='MS')
+        monthly_counts = {
+            label: signals[label].resample('MS').sum().reindex(monthly_index, fill_value=0)
+            for label in labels
+        }
+        overlap_monthly_count = events.resample('MS').size().reindex(monthly_index, fill_value=0)
+        gaps = events.index.to_series().diff().dt.days.dropna()
+        median_gap = gaps.median() if not gaps.empty else np.nan
+        max_gap = gaps.max() if not gaps.empty else np.nan
+
+        config_keys = ['ma_window', 'volatility_window', 'volatility_regime', 'volatility_bins', 'divergence_percentile']
+        common_keys = [key for key in config_keys if len({config[key] for config in configs}) == 1]
+        variable_keys = [key for key in config_keys if key not in common_keys]
+
+        def config_part(key: str, value: int | float) -> str:
+            if key == 'ma_window':
+                return f'MA{value}'
+            if key == 'volatility_window':
+                return f'vol{value}D'
+            if key == 'volatility_regime':
+                return f'Q{value}'
+            if key == 'volatility_bins':
+                return f'{value} bins'
+            return f'div<={value:g}%'
+
+        common_text = ' | '.join(config_part(key, configs[0][key]) for key in common_keys) or 'mixed settings'
+        short_labels = []
+        for position, config in enumerate(configs, start=1):
+            parts = [config_part(key, config[key]) for key in variable_keys]
+            short_labels.append(' | '.join(parts) if parts else f'config {position}')
+        signal_counts = [int(signals[label].sum()) for label in labels]
+        display_labels = [f'{label} (n={count})' for label, count in zip(short_labels, signal_counts)]
+        overlap_rates = [f'{len(events) / count:.0%}' if count else 'n/a' for count in signal_counts]
+
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            row_heights=[0.68, 0.32],
+            vertical_spacing=0.1,
+            subplot_titles=['Signal dates by configuration', 'Signal days by month'],
+        )
+        colors = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e']
+        for position, label in enumerate(labels):
+            dates = signals.index[signals[label]]
+            fig.add_trace(
+                go.Scatter(
+                    x=dates,
+                    y=np.full(len(dates), position),
+                    mode='markers',
+                    name=short_labels[position],
+                    marker=dict(color=colors[position % len(colors)], size=6),
+                    hovertemplate=f'{label}<br>Date: %{{x|%Y-%m-%d}}<extra></extra>',
+                    showlegend=False,
+                ),
+                row=1,
+                col=1,
+            )
+        fig.add_trace(
+            go.Scatter(
+                x=events.index,
+                y=np.full(len(events), -0.55),
+                mode='markers',
+                name='overlap',
+                marker=dict(color='#111111', size=9, symbol='x'),
+                hovertemplate='Overlap date: %{x|%Y-%m-%d}<extra></extra>',
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        for position, label in enumerate(labels):
+            fig.add_trace(
+                go.Bar(
+                    x=monthly_counts[label].index,
+                    y=monthly_counts[label],
+                    name=short_labels[position],
+                    marker_color=colors[position % len(colors)],
+                    hovertemplate=f'{short_labels[position]}<br>Month: %{{x|%Y-%m}}<br>Signal days: %{{y}}<extra></extra>',
+                ),
+                row=2,
+                col=1,
+            )
+        fig.add_trace(
+            go.Bar(
+                x=overlap_monthly_count.index,
+                y=overlap_monthly_count,
+                name='overlap',
+                marker_color='#111111',
+                hovertemplate='Overlap<br>Month: %{x|%Y-%m}<br>Signal days: %{y}<extra></extra>',
+            ),
+            row=2,
+            col=1,
+        )
+
+        gap_text = 'n/a' if pd.isna(median_gap) else f'{median_gap:.0f} days'
+        max_gap_text = 'n/a' if pd.isna(max_gap) else f'{max_gap:.0f} days'
+        fig.update_layout(
+            title=(
+                f'Signal overlap | common: {common_text}<br>'
+                f'{" | ".join(display_labels)} '
+                f'| overlap: {len(events)} ({" / ".join(overlap_rates)}) '
+                f'| median gap {gap_text} | max gap {max_gap_text}'
+            ),
+            template='plotly_white',
+            height=700,
+            barmode='group',
+            legend=dict(orientation='h', x=0, y=0.43, xanchor='left', yanchor='bottom'),
+        )
+        fig.update_yaxes(
+            title_text='Signal configuration',
+            tickmode='array',
+            tickvals=[-0.55, *range(len(labels))],
+            ticktext=['overlap', *display_labels],
+            range=[-1, len(labels)],
+            row=1,
+            col=1,
+        )
+        fig.update_yaxes(title_text='Overlap days', row=2, col=1)
         fig.update_xaxes(title_text='Date', row=2, col=1)
         fig.show()
         return events
