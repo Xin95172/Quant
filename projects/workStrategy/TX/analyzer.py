@@ -170,6 +170,64 @@ class TXAnalyzer:
             ),
         }, name='session_alignment')
 
+    @staticmethod
+    def double_sort_thresholds(
+        primary: pd.Series,
+        secondary: pd.Series,
+        *,
+        primary_percentile_range: tuple[float, float],
+        secondary_percentile: float | tuple[float, float],
+    ) -> pd.Series:
+        """Convert a conditional two-factor percentile rule into raw cutoffs.
+
+        First retain observations whose ``primary`` value is inside the given
+        percentile range. Then calculate a ``secondary`` percentile cutoff
+        (or range) within those retained observations. A scalar secondary
+        percentile means the left-tail range ``(0, percentile)``; a tuple
+        explicitly selects ``(lower, upper)``. This is a sequential
+        (conditional) double sort, not a product of two factors.
+
+        All inputs should be restricted to the training period before calling
+        this method. Percentiles use the 0--100 convention.
+        """
+        lower_pct, upper_pct = map(float, primary_percentile_range)
+        if not 0 <= lower_pct < upper_pct <= 100:
+            raise ValueError('primary_percentile_range must satisfy 0 <= lower < upper <= 100')
+        if isinstance(secondary_percentile, tuple):
+            secondary_lower_pct, secondary_upper_pct = map(float, secondary_percentile)
+        else:
+            secondary_lower_pct, secondary_upper_pct = 0.0, float(secondary_percentile)
+        if not 0 <= secondary_lower_pct < secondary_upper_pct <= 100:
+            raise ValueError('secondary_percentile must satisfy 0 <= lower < upper <= 100')
+
+        frame = pd.concat(
+            {'primary': primary, 'secondary': secondary},
+            axis=1,
+        ).dropna()
+        if frame.empty:
+            raise ValueError('no overlapping non-null observations are available')
+
+        primary_lower = float(frame['primary'].quantile(lower_pct / 100))
+        primary_upper = float(frame['primary'].quantile(upper_pct / 100))
+        selected = frame.loc[frame['primary'].between(primary_lower, primary_upper, inclusive='both')]
+        if selected.empty:
+            raise ValueError('the primary percentile range selected no observations')
+
+        secondary_lower = float(selected['secondary'].quantile(secondary_lower_pct / 100))
+        secondary_upper = float(selected['secondary'].quantile(secondary_upper_pct / 100))
+        return pd.Series({
+            'primary_lower_percentile': lower_pct,
+            'primary_upper_percentile': upper_pct,
+            'primary_lower_cutoff': primary_lower,
+            'primary_upper_cutoff': primary_upper,
+            'secondary_lower_percentile': secondary_lower_pct,
+            'secondary_upper_percentile': secondary_upper_pct,
+            'secondary_lower_cutoff': secondary_lower,
+            'secondary_upper_cutoff': secondary_upper,
+            'observations': len(frame),
+            'selected_observations': len(selected),
+        }, name='double_sort_thresholds')
+
     def for_period(
         self,
         *,
@@ -245,8 +303,8 @@ class TXAnalyzer:
             total_ret_val = total_pnl
         else:
             # Percentage Mode: Calculation is compounded
-            cum_ret = returns.cumsum()
-            total_ret_val = cum_ret.iloc[-1] if not cum_ret.empty else 0.0
+            cum_ret = (1 + returns).cumprod()
+            total_ret_val = cum_ret.iloc[-1] - 1 if not cum_ret.empty else 0.0
         
         # 2. Time Statistics
         trading_days = len(returns)
@@ -269,14 +327,14 @@ class TXAnalyzer:
                 ann_pnl = (total_pnl / trading_days) * ann_factor if trading_days > 0 else 0
                 sharpe = ann_pnl / vol_ann
             else:
-                sharpe = cagr / vol_ann
+                sharpe = returns.mean() / returns.std() * np.sqrt(ann_factor)
         
         # 3. Drawdown Statistics
         running_max = cum_ret.cummax()
         if point_version:
             drawdown = cum_ret - running_max # Points down
         else:
-            drawdown = cum_ret - running_max # Pct down
+            drawdown = cum_ret / running_max - 1
             
         max_dd = drawdown.min()
         
@@ -1047,8 +1105,9 @@ class TXAnalyzer:
         volatility_window: int | None = None,
         volatility_regime: int | None = None,
         volatility_bins: int = 5,
+        return_series: bool = False,
     ):
-        """Plot MA divergence, or return its raw percentile threshold.
+        """Plot MA divergence, return its percentile threshold, or return its series.
 
         When ``percentile`` is provided, the method returns a float instead of
         plotting. Optionally pass a historical-volatility window and regime to
@@ -1065,12 +1124,17 @@ class TXAnalyzer:
             raise ValueError('volatility_regime must be between 1 and volatility_bins')
         if volatility_bins < 2:
             raise ValueError('volatility_bins must be at least 2')
+        if return_series and percentile is not None:
+            raise ValueError('return_series and percentile cannot be used together')
 
         temp_df = self.df.copy()
         temp_df[f'{window}_ma'] = temp_df['Close'].rolling(window=window).mean()
         temp_df['divergence'] = (temp_df['Close'] / temp_df[f'{window}_ma']) - 1
         temp_df['divergence'] = temp_df['divergence'].shift(1)
         temp_df = temp_df.dropna(subset=['divergence'])
+
+        if return_series:
+            return temp_df['divergence'].rename(f'ma_divergence_{window}')
 
         if percentile is not None:
             divergence = temp_df['divergence']
@@ -1111,14 +1175,19 @@ class TXAnalyzer:
         *,
         percentile: float | None = None,
         side: str = 'low',
+        return_series: bool = False,
     ):
-        """Plot historical volatility, or return its raw percentile threshold."""
+        """Plot historical volatility, return a percentile threshold, or return its series."""
         if window < 2:
             raise ValueError('window must be at least 2')
         temp_df = self.df.copy()
         temp_df['hist_vol'] = temp_df['daily_ret'].rolling(window=window).std()
         temp_df['hist_vol'] = temp_df['hist_vol'].shift(1)
         temp_df = temp_df.dropna(subset=['hist_vol'])
+        if return_series and percentile is not None:
+            raise ValueError('return_series and percentile cannot be used together')
+        if return_series:
+            return temp_df['hist_vol'].rename(f'hist_vol_{window}')
         if percentile is not None:
             return self._percentile_value(temp_df['hist_vol'], percentile, side)
 
@@ -2196,14 +2265,32 @@ class TXAnalyzer:
     # =========================================================================
     def evaluate(
         self,
-        config: StrategyConfig | None = None,
+        positions: pd.DataFrame | StrategyConfig | None = None,
         *,
+        one_way_cost: float = 0.0,
+        config: StrategyConfig | None = None,
         point_version: bool = False,
         start: str | pd.Timestamp | None = None,
         end: str | pd.Timestamp | None = None,
     ) -> pd.DataFrame:
-        """Return a backtest result frame without rendering or writing an output file."""
-        result = self._build_backtest_frame(point_version=point_version, config=config)
+        """Evaluate user-supplied day/night positions or the legacy configured strategy.
+
+        ``positions`` must be date-indexed and contain ``pos_day`` and
+        ``pos_night``. A position of 1, -1, or 0 means long, short, or flat for
+        that session. Passing no positions retains the legacy strategy path.
+        """
+        if isinstance(positions, StrategyConfig):
+            config = positions
+            positions = None
+        result = (
+            self._build_backtest_frame(point_version=point_version, config=config)
+            if positions is None
+            else self._build_position_backtest_frame(
+                positions,
+                one_way_cost=one_way_cost,
+                point_version=point_version,
+            )
+        )
         if start is not None:
             result = result.loc[result.index >= pd.Timestamp(start)]
         if end is not None:
@@ -2220,7 +2307,57 @@ class TXAnalyzer:
         """Summarize an ``evaluate()`` result or an explicitly sliced validation period."""
         if return_column not in result:
             raise KeyError(f"result missing return column: {return_column}")
-        return pd.Series(self._calculate_metrics(result[return_column].copy(), point_version=point_version))
+        summary = pd.Series(self._calculate_metrics(result[return_column].copy(), point_version=point_version))
+        if 'turnover' in result and len(result):
+            summary['Annual Turnover'] = result['turnover'].fillna(0).mean() * 252
+        return summary
+
+    def _build_position_backtest_frame(
+        self,
+        positions: pd.DataFrame,
+        *,
+        one_way_cost: float,
+        point_version: bool,
+    ) -> pd.DataFrame:
+        """Apply a date-indexed position matrix to the paired session returns."""
+        required = {'pos_day', 'pos_night'}
+        missing = required - set(positions.columns)
+        if missing:
+            raise KeyError(f"positions missing columns: {sorted(missing)}")
+        if one_way_cost < 0:
+            raise ValueError('one_way_cost must be non-negative')
+
+        position_frame = positions.loc[:, ['pos_day', 'pos_night']].copy()
+        position_frame.index = pd.to_datetime(position_frame.index).normalize()
+        if position_frame.index.duplicated().any():
+            raise ValueError('positions must contain at most one row per trading date')
+        df = self.df.join(position_frame, how='left')
+        df[['pos_day', 'pos_night']] = df[['pos_day', 'pos_night']].fillna(0.0)
+
+        df['turnover'] = (
+            df['pos_day'].diff().abs().fillna(df['pos_day'].abs())
+            + df['pos_night'].diff().abs().fillna(df['pos_night'].abs())
+        )
+        if point_version:
+            df['gross_ret'] = df['pos_day'] * df['daily_pnl'] + df['pos_night'] * df['daily_pnl_a']
+            df['benchmark_ret'] = df['daily_pnl'] + df['daily_pnl_a']
+        else:
+            df['gross_ret'] = (
+                (1 + df['pos_day'] * df['daily_ret'])
+                * (1 + df['pos_night'] * df['daily_ret_a']) - 1
+            )
+            df['benchmark_ret'] = (1 + df['daily_ret']) * (1 + df['daily_ret_a']) - 1
+        df['cost'] = df['turnover'] * one_way_cost
+        df['strat_ret'] = df['gross_ret'] - df['cost']
+        if point_version:
+            df['equity_strat'] = df['strat_ret'].fillna(0).cumsum()
+            df['equity_benchmark'] = df['benchmark_ret'].fillna(0).cumsum()
+        else:
+            df['equity_strat'] = (1 + df['strat_ret'].fillna(0)).cumprod()
+            df['equity_benchmark'] = (1 + df['benchmark_ret'].fillna(0)).cumprod()
+        df['cum_strat'] = df['equity_strat'] - 1
+        df['cum_bnh'] = df['equity_benchmark'] - 1
+        return df
 
     def _build_backtest_frame(
         self,
@@ -2286,9 +2423,19 @@ class TXAnalyzer:
         config: StrategyConfig | None = None,
         start: str | pd.Timestamp | None = None,
         end: str | pd.Timestamp | None = None,
+        *,
+        positions: pd.DataFrame | None = None,
+        one_way_cost: float = 0.0,
     ):
-        """Run the configured strategy, save the result frame, and display performance."""
-        df = self.evaluate(config=config, point_version=point_version, start=start, end=end)
+        """Run a supplied position matrix or the legacy configured strategy."""
+        df = self.evaluate(
+            positions,
+            config=config,
+            one_way_cost=one_way_cost,
+            point_version=point_version,
+            start=start,
+            end=end,
+        )
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         df.to_csv(OUTPUT_DIR / 'backtest.csv', index=True)
@@ -2334,7 +2481,7 @@ class TXAnalyzer:
         # ===============================================================
         # 5. 顯示風控事件 (Risk Events)
         # ===============================================================
-        if risk_log:
+        if risk_log and positions is None:
             print("=== Risk Events Log (Top 20) ===")
             risk_events = self.check_risk_events()
             if not risk_events.empty:
