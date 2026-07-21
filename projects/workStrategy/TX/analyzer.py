@@ -142,6 +142,26 @@ class TXAnalyzer:
             quantile = 1 - quantile
         return float(clean_values.quantile(quantile))
 
+    @classmethod
+    def _indicator_value(
+        cls,
+        values: pd.Series,
+        *,
+        name: str,
+        return_series: bool,
+        percentile: float | None,
+        side: str,
+    ) -> pd.Series | float | None:
+        """Apply the shared indicator interface before the charting path."""
+        if return_series and percentile is not None:
+            raise ValueError('return_series and percentile cannot be used together')
+        series = values.rename(name)
+        if return_series:
+            return series.dropna()
+        if percentile is not None:
+            return cls._percentile_value(series, percentile, side)
+        return None
+
     def set_config(self, config: StrategyConfig) -> None:
         """Replace the active strategy configuration for subsequent analysis and backtests."""
         self.config = config
@@ -227,6 +247,212 @@ class TXAnalyzer:
             'observations': len(frame),
             'selected_observations': len(selected),
         }, name='double_sort_thresholds')
+
+    def conditional_factor_sort(
+        self,
+        conditions: list[dict],
+        sort_factor: pd.Series | str,
+        *,
+        return_column: str = 'daily_ret',
+        plot_return_columns: list[str] | tuple[str, ...] | None = None,
+        bin_percentile: float = 5,
+        demean_return: bool = False,
+        plot_mode: str = 'sorted',
+        title: str | None = None,
+    ) -> pd.DataFrame:
+        """Condition on sequential factor-percentile ranges, then sort one factor.
+
+        Each item in ``conditions`` must contain ``factor`` and
+        ``percentile_range``. ``factor`` can be a series returned by an
+        indicator with ``return_series=True`` or a column name from the
+        analyzer frame. Every percentile range is ranked *within the rows
+        retained by earlier conditions*. ``sort_factor`` is then ranked within
+        the final selected rows and split into equal percentile bins.
+
+        With ``plot_mode='sorted'`` (default), the chart follows the indicator
+        convention: after the final factor is sorted, it plots cumulative
+        demeaned returns on the main panel, the final factor on the right axis,
+        and cumulative raw returns below. With ``plot_mode='bin'``, it plots
+        the mean return for each final-factor percentile bin instead.
+        ``plot_return_columns`` defaults to ``return_column``. Pass multiple
+        columns explicitly when the day and night curves should be shown
+        together. The returned table contains final-bin statistics; sequential
+        cutoffs and selected dates are available in ``result.attrs`` as
+        ``selection_summary`` and ``selected_data``.
+        """
+        if not conditions:
+            raise ValueError('conditions must contain at least one percentile-range condition')
+        if return_column not in self.df:
+            raise KeyError(f'missing return column: {return_column}')
+        if not 0 < bin_percentile <= 50:
+            raise ValueError('bin_percentile must be greater than 0 and at most 50')
+        if plot_mode not in {'sorted', 'bin'}:
+            raise ValueError("plot_mode must be either 'sorted' or 'bin'")
+        if plot_return_columns is None:
+            plot_return_columns = [return_column]
+        else:
+            plot_return_columns = list(plot_return_columns)
+            if not plot_return_columns:
+                raise ValueError('plot_return_columns must contain at least one return column')
+            missing_plot_columns = set(plot_return_columns) - set(self.df.columns)
+            if missing_plot_columns:
+                raise KeyError(f'missing plot return columns: {sorted(missing_plot_columns)}')
+
+        def resolve_factor(factor: pd.Series | str, fallback_name: str) -> tuple[pd.Series, str]:
+            if isinstance(factor, str):
+                if factor not in self.df:
+                    raise KeyError(f'missing factor column: {factor}')
+                return self.df[factor].rename(factor), factor
+            if not isinstance(factor, pd.Series):
+                raise TypeError('each factor must be a pandas Series or an analyzer column name')
+            return factor.rename(factor.name or fallback_name), factor.name or fallback_name
+
+        resolved_conditions: list[tuple[str, pd.Series, float, float]] = []
+        for index, condition in enumerate(conditions, start=1):
+            if not isinstance(condition, dict):
+                raise TypeError('each condition must be a dictionary')
+            if 'factor' not in condition or 'percentile_range' not in condition:
+                raise ValueError("each condition requires 'factor' and 'percentile_range'")
+            extra_keys = set(condition) - {'factor', 'percentile_range', 'name'}
+            if extra_keys:
+                raise ValueError(f'unsupported condition keys: {sorted(extra_keys)}')
+            try:
+                lower_pct, upper_pct = map(float, condition['percentile_range'])
+            except (TypeError, ValueError) as error:
+                raise ValueError('percentile_range must be a two-value tuple such as (60, 80)') from error
+            if not 0 <= lower_pct < upper_pct <= 100:
+                raise ValueError('each percentile_range must satisfy 0 <= lower < upper <= 100')
+            series, default_name = resolve_factor(condition['factor'], f'condition_{index}')
+            name = str(condition.get('name') or default_name)
+            resolved_conditions.append((name, series, lower_pct, upper_pct))
+
+        final_factor, final_factor_name = resolve_factor(sort_factor, 'sort_factor')
+        frame = pd.DataFrame({'return': self.df[return_column], 'sort_factor': final_factor})
+        for column in plot_return_columns:
+            frame[column] = self.df[column]
+        for index, (name, series, _, _) in enumerate(resolved_conditions, start=1):
+            frame[f'condition_{index}'] = series
+        frame = frame.dropna().copy()
+        if frame.empty:
+            raise ValueError('no overlapping non-null observations are available')
+
+        selection_rows = []
+        selected = frame
+        for index, (name, _, lower_pct, upper_pct) in enumerate(resolved_conditions, start=1):
+            column = f'condition_{index}'
+            before_count = len(selected)
+            selected = selected.copy()
+            lower_cutoff = float(selected[column].quantile(lower_pct / 100))
+            upper_cutoff = float(selected[column].quantile(upper_pct / 100))
+            selected['percentile'] = selected[column].rank(method='first', pct=True) * 100
+            selected = selected.loc[
+                (selected['percentile'] > lower_pct) & (selected['percentile'] <= upper_pct)
+            ].copy()
+            if selected.empty:
+                raise ValueError(f"condition '{name}' selected no observations")
+            selection_rows.append({
+                'step': index,
+                'factor': name,
+                'percentile_range': f'{lower_pct:g}% to {upper_pct:g}%',
+                'lower_cutoff': lower_cutoff,
+                'upper_cutoff': upper_cutoff,
+                'observations_before': before_count,
+                'observations_after': len(selected),
+            })
+            selected = selected.drop(columns='percentile')
+
+        selected = selected.sort_values('sort_factor').copy()
+        selected['sort_percentile'] = selected['sort_factor'].rank(method='first', pct=True) * 100
+        selected['display_return'] = (
+            selected['return'] - selected['return'].mean() if demean_return else selected['return']
+        )
+        bin_edges = np.append(np.arange(0, 100, bin_percentile), 100.0)
+        result_rows = []
+        for lower_pct, upper_pct in zip(bin_edges[:-1], bin_edges[1:]):
+            values = selected.loc[
+                (selected['sort_percentile'] > lower_pct) & (selected['sort_percentile'] <= upper_pct)
+            ]
+            result_rows.append({
+                'sort_percentile_bin': f'{lower_pct:g}% to {upper_pct:g}%',
+                'lower_percentile': lower_pct,
+                'upper_percentile': upper_pct,
+                'factor_lower': values['sort_factor'].min(),
+                'factor_upper': values['sort_factor'].max(),
+                'mean_factor': values['sort_factor'].mean(),
+                'mean_return': values['display_return'].mean(),
+                'median_return': values['display_return'].median(),
+                'P(return<0)': (values['return'] < 0).mean(),
+                'observations': len(values),
+            })
+        result = pd.DataFrame(result_rows).set_index('sort_percentile_bin')
+        result.attrs['selection_summary'] = pd.DataFrame(selection_rows).set_index('step')
+        result.attrs['selected_data'] = selected.drop(columns='display_return')
+
+        condition_text = ' → '.join(
+            f'{row["factor"]} {row["percentile_range"]}' for row in selection_rows
+        )
+        chart_title = title or final_factor_name
+        if plot_mode == 'sorted':
+            chart_frame = selected.reset_index(drop=True).copy()
+            cumulative_demeaned_columns = []
+            cumulative_return_columns = []
+            for column in plot_return_columns:
+                demeaned_column = f'demeaned_{column}'
+                cumulative_demeaned_column = f'cum_{demeaned_column}'
+                cumulative_return_column = f'cum_{column}'
+                chart_frame[demeaned_column] = chart_frame[column] - chart_frame[column].mean()
+                chart_frame[cumulative_demeaned_column] = chart_frame[demeaned_column].cumsum()
+                chart_frame[cumulative_return_column] = chart_frame[column].cumsum()
+                cumulative_demeaned_columns.append(cumulative_demeaned_column)
+                cumulative_return_columns.append(cumulative_return_column)
+            plot.plot(
+                chart_frame,
+                ly=cumulative_demeaned_columns,
+                ry='sort_factor',
+                sub_ly=cumulative_return_columns,
+                title=chart_title,
+                note=f'{condition_text}<br>Sample size: {len(chart_frame)}',
+            )
+        else:
+            colors = ['#b2182b' if value < 0 else '#2166ac' for value in result['mean_return'].fillna(0)]
+            customdata = np.column_stack((
+                result['factor_lower'],
+                result['factor_upper'],
+                result['mean_factor'],
+                result['median_return'],
+                result['P(return<0)'],
+                result['observations'],
+            ))
+            value_label = f'Demeaned {return_column}' if demean_return else return_column
+            fig = go.Figure(
+                go.Bar(
+                    x=result.index,
+                    y=result['mean_return'],
+                    marker_color=colors,
+                    customdata=customdata,
+                    hovertemplate=(
+                        f'{final_factor_name} percentile bin: %{{x}}<br>'
+                        'Raw factor range: %{customdata[0]:.4%} to %{customdata[1]:.4%}<br>'
+                        'Mean raw factor: %{customdata[2]:.4%}<br>'
+                        f'Mean {value_label}: %{{y:.3%}}<br>'
+                        f'Median {value_label}: %{{customdata[3]:.3%}}<br>'
+                        'P(raw return < 0): %{customdata[4]:.1%}<br>'
+                        'Observations: %{customdata[5]}'
+                        '<extra></extra>'
+                    ),
+                )
+            )
+            fig.update_layout(
+                title=f'{chart_title}<br><sup>{condition_text} | Sample size: {len(selected)}</sup>',
+                template='plotly_white',
+                height=520,
+                showlegend=False,
+            )
+            fig.update_xaxes(title_text=f'{final_factor_name} percentile within selected sample')
+            fig.update_yaxes(title_text=f'Mean {value_label}', tickformat='.2%')
+            fig.add_hline(y=0, line_color='#555555', line_width=1)
+            fig.show()
+        return result
 
     def for_period(
         self,
@@ -777,23 +1003,29 @@ class TXAnalyzer:
     # =========================================================================
     # Factor diagnostics: position and calendar
     # =========================================================================
-    def indicator_position_ret(self):
+    def indicator_position_ret(self, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
         df['ind'] = df['daily_ret'].shift(1) + df['daily_ret_a'].shift(1) + df['daily_ret'].shift(2)
         df['ind'] = df['ind'].rolling(window=3).sum()
+        result = self._indicator_value(df['ind'], name='position_ret', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df = df.sort_values(by='daily_ret').reset_index(drop=True)
         df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
         df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
         return plot.plot(df, ly='cum_demeaned_daily_ret_a', x='index', ry = 'daily_ret', sub_ly=['cum_daily_ret_a'])
 
-    def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False):
+    def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
 
         # Calendar
         df.index = pd.to_datetime(df.index)
         df['prev_date'] = df.index.to_series().shift(1)
         df['gap'] = (df.index.to_series() - df['prev_date']).dt.days
+        result = self._indicator_value(df['gap'], name='gap_days', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         
         if after_holiday:
             # 想看週一 (Post-holiday)
@@ -842,11 +1074,14 @@ class TXAnalyzer:
     # =========================================================================
     # Factor diagnostics: margin and options
     # =========================================================================
-    def indicator_maintenance_rate(self, point_version: bool = False):
+    def indicator_maintenance_rate(self, point_version: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         if 'TotalExchangeMarginMaintenance' not in self.df.columns:
             raise ValueError("TotalExchangeMarginMaintenance is not in the DataFrame.")
         temp_df = self.df.copy()
         temp_df['TotalExchangeMarginMaintenance'] = temp_df['TotalExchangeMarginMaintenance'].shift(1)
+        result = self._indicator_value(temp_df['TotalExchangeMarginMaintenance'], name='maintenance_rate', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         if point_version:
             temp_df['daily_ret_a'] = (temp_df['Close_a'] - temp_df['Open_a'])
             temp_df['daily_ret'] = (temp_df['Close'] - temp_df['Open'])
@@ -860,9 +1095,12 @@ class TXAnalyzer:
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title='margin_maintenance_rate')
 
-    def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = ['day', 'night']):
+    def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = 'day', *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
         if trading_session == 'day':
+            result = self._indicator_value(df['SkewSlope_a'], name='option_iv_day', return_series=return_series, percentile=percentile, side=side)
+            if result is not None:
+                return result
             df = df.sort_values(by='SkewSlope_a').reset_index(drop=True)
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
@@ -870,17 +1108,23 @@ class TXAnalyzer:
             return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='SkewSlope_a', sub_ly=['cum_daily_ret'], title='option_iv_night')
         elif trading_session == 'night':
             df['SkewSlope'] = df['SkewSlope'].shift(1)
+            result = self._indicator_value(df['SkewSlope'], name='option_iv_night', return_series=return_series, percentile=percentile, side=side)
+            if result is not None:
+                return result
             df = df.sort_values(by='SkewSlope').reset_index(drop=True)
             df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
             df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'], title='option_iv_day')
     
-    def indicator_opt_position(self, indicator: str = 'Foreign_Opt_Signal', trading_session: str = 'day' or 'night', sub_analysis: bool = False, time_series_analysis: bool = False):
+    def indicator_opt_position(self, indicator: str = 'Foreign_Opt_Signal', trading_session: str = 'day', sub_analysis: bool = False, time_series_analysis: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         # Foreign_Opt_Signal, Dealer_Opt_Signal
         # signal 代表，每一塊錢中，有多少做多(> 0) / 做空(< 0)
         df = self.df.copy()
         if trading_session == 'day':
+            result = self._indicator_value(df[f'{indicator}_a'], name=f'{indicator}_day', return_series=return_series, percentile=percentile, side=side)
+            if result is not None:
+                return result
             df = df.sort_values(by=f'{indicator}_a').reset_index(drop=True)
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
@@ -909,6 +1153,9 @@ class TXAnalyzer:
         elif trading_session == 'night':
             df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[f'{indicator}'].shift(1)
             df['pos_continue'] = df['pos_continue'].shift(1)
+            result = self._indicator_value(df['pos_continue'], name=f'{indicator}_night', return_series=return_series, percentile=percentile, side=side)
+            if result is not None:
+                return result
             if time_series_analysis:
                 df['signal'] = df['pos_continue'] > 0.012
                 df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
@@ -1068,10 +1315,13 @@ class TXAnalyzer:
         print("=== Conditional Downside/Upstate Vol (rolling window) ===")
         print(cond_df)
 
-    def indicator_margin_delta(self):
+    def indicator_margin_delta(self, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         temp_df = self.df.copy()
         temp_df['margin_delta'] = (temp_df['MarginPurchaseMoney']/temp_df['MarginPurchaseMoney'].shift(1)) - 1
         temp_df['avg_margin_delta'] = temp_df['margin_delta'].shift(1).rolling(window=20).mean()
+        result = self._indicator_value(temp_df['avg_margin_delta'], name='margin_delta', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         temp_df = temp_df.sort_values(by='avg_margin_delta').reset_index(drop=True)
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
@@ -1082,10 +1332,13 @@ class TXAnalyzer:
         temp_df['cum_ret'] = (temp_df['daily_ret_a'] + temp_df['daily_ret']).cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='avg_margin_delta', sub_ly=['cum_daily_ret_a', 'cum_daily_ret', 'cum_ret'], title='margin_delta')
 
-    def indicator_institutional_flow(self):
+    def indicator_institutional_flow(self, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         temp_df = self.df.copy()
         temp_df['foreign_inflow'] = (temp_df['Net_Foreign_Investor'] - temp_df['Net_Foreign_Investor'].rolling(window=20).mean()) / temp_df['Net_Foreign_Investor'].rolling(window=20).std()
         temp_df['foreign_inflow'] = temp_df['foreign_inflow'].shift(1)
+        result = self._indicator_value(temp_df['foreign_inflow'], name='institutional_flow', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
         temp_df = temp_df.sort_values(by='foreign_inflow').reset_index(drop=True)
@@ -1312,6 +1565,187 @@ class TXAnalyzer:
         fig.update_xaxes(title_text='Divergence percentile within each MA window', range=[0, 100])
         fig.update_yaxes(title_text='MA window')
         fig.show()
+
+    def compare_factor_by_condition(
+        self,
+        factors: dict[str, pd.Series] | pd.Series | str,
+        *,
+        condition_factor: pd.Series | str,
+        return_column: str = 'daily_ret',
+        condition_bins: int = 5,
+        factor_bin_percentile: float = 20,
+        demean_return: bool = False,
+        condition_name: str | None = None,
+        factor_value_format: str = '.4g',
+        condition_value_format: str = '.4g',
+        title: str | None = None,
+    ) -> pd.DataFrame:
+        """Compare arbitrary factors across regimes of another arbitrary factor.
+
+        ``factors`` is either one series/column name or a mapping from display
+        names to factor series. ``condition_factor`` is split into quantile
+        regimes; inside every regime each tested factor is ranked and split
+        into percentile bins. This is useful for questions such as: "within
+        each volatility regime, how does fear/greed relate to next-day return?"
+
+        Set ``condition_bins=1`` to skip the regime split and inspect a factor
+        over the entire selected sample. ``factor_value_format`` and
+        ``condition_value_format`` use Plotly/D3 number formatting in hover
+        labels; pass ``'.2%'`` for percentage-valued factors. A heatmap is
+        shown and the returned table contains return and raw-factor summaries.
+        """
+        if return_column not in self.df:
+            raise KeyError(f'missing return column: {return_column}')
+        if condition_bins < 1:
+            raise ValueError('condition_bins must be at least 1')
+        if not 0 < factor_bin_percentile <= 50:
+            raise ValueError('factor_bin_percentile must be greater than 0 and at most 50')
+
+        def resolve_factor(factor: pd.Series | str, fallback_name: str) -> tuple[pd.Series, str]:
+            if isinstance(factor, str):
+                if factor not in self.df:
+                    raise KeyError(f'missing factor column: {factor}')
+                return self.df[factor].rename(factor), factor
+            if not isinstance(factor, pd.Series):
+                raise TypeError('factors must be pandas Series or analyzer column names')
+            return factor.rename(factor.name or fallback_name), factor.name or fallback_name
+
+        if isinstance(factors, dict):
+            if not factors:
+                raise ValueError('factors must contain at least one factor')
+            resolved_factors = {
+                str(name): resolve_factor(series, str(name))[0]
+                for name, series in factors.items()
+            }
+        else:
+            series, name = resolve_factor(factors, 'factor')
+            resolved_factors = {name: series}
+
+        condition_series, default_condition_name = resolve_factor(condition_factor, 'condition')
+        condition_name = condition_name or default_condition_name
+        base = pd.DataFrame({
+            'return': self.df[return_column],
+            'condition': condition_series,
+        }).dropna()
+        if base.empty:
+            raise ValueError('no overlapping non-null observations are available for return and condition factor')
+        if condition_bins == 1:
+            base['condition_group'] = 0
+            regime_labels = ['all observations']
+        else:
+            try:
+                base['condition_group'] = pd.qcut(
+                    base['condition'],
+                    q=condition_bins,
+                    labels=False,
+                    duplicates='raise',
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f'condition factor cannot be split into {condition_bins} bins: {condition_name}'
+                ) from error
+            if base['condition_group'].nunique() != condition_bins:
+                raise ValueError(f'condition factor cannot create {condition_bins} non-empty bins: {condition_name}')
+            regime_labels = [f'Q{group + 1}' for group in range(condition_bins)]
+            regime_labels[0] += ' low'
+            regime_labels[-1] += ' high'
+
+        bin_edges = np.append(np.arange(0, 100, factor_bin_percentile), 100.0)
+        bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
+        column_labels = [f'{regime}\n{bin_label}' for regime in regime_labels for bin_label in bin_labels]
+        factor_names = list(resolved_factors)
+        mean_returns = np.full((len(factor_names), len(column_labels)), np.nan)
+        median_returns = np.full((len(factor_names), len(column_labels)), np.nan)
+        neg_ratios = np.full((len(factor_names), len(column_labels)), np.nan)
+        mean_factors = np.full((len(factor_names), len(column_labels)), np.nan)
+        mean_conditions = np.full((len(factor_names), len(column_labels)), np.nan)
+        observations = np.zeros((len(factor_names), len(column_labels)), dtype=int)
+
+        for row, (factor_name, factor_series) in enumerate(resolved_factors.items()):
+            frame = base.join(factor_series.rename('factor')).dropna(subset=['factor']).copy()
+            if frame.empty:
+                continue
+            frame['display_return'] = frame['return'] - frame['return'].mean() if demean_return else frame['return']
+            for group in range(condition_bins):
+                regime = frame.loc[frame['condition_group'].eq(group)].copy()
+                if regime.empty:
+                    continue
+                regime['factor_percentile'] = regime['factor'].rank(method='first', pct=True) * 100
+                for bin_index, (lower_pct, upper_pct) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+                    column = group * len(bin_labels) + bin_index
+                    values = regime.loc[
+                        (regime['factor_percentile'] > lower_pct)
+                        & (regime['factor_percentile'] <= upper_pct)
+                    ]
+                    mean_returns[row, column] = values['display_return'].mean()
+                    median_returns[row, column] = values['display_return'].median()
+                    neg_ratios[row, column] = (values['return'] < 0).mean() if len(values) else np.nan
+                    mean_factors[row, column] = values['factor'].mean()
+                    mean_conditions[row, column] = values['condition'].mean()
+                    observations[row, column] = len(values)
+
+        customdata = np.stack((mean_factors, mean_conditions, median_returns, neg_ratios, observations), axis=-1)
+        column_positions = np.arange(len(column_labels))
+        value_label = f'Demeaned {return_column}' if demean_return else return_column
+        fig = go.Figure(
+            go.Heatmap(
+                x=column_positions,
+                y=factor_names,
+                z=mean_returns,
+                customdata=customdata,
+                text=np.tile(column_labels, (len(factor_names), 1)),
+                colorscale='RdBu',
+                zmid=0,
+                xgap=1,
+                ygap=1,
+                colorbar=dict(title=f'Mean<br>{value_label}', tickformat='.1%'),
+                hovertemplate=(
+                    'Factor: %{y}<br>%{text}<br>'
+                    f'Mean raw factor: %{{customdata[0]:{factor_value_format}}}<br>'
+                    f'Mean {condition_name}: %{{customdata[1]:{condition_value_format}}}<br>'
+                    f'Mean {value_label}: %{{z:.3%}}<br>'
+                    f'Median {value_label}: %{{customdata[2]:.3%}}<br>'
+                    'P(raw return < 0): %{customdata[3]:.1%}<br>'
+                    'Observations: %{customdata[4]}'
+                    '<extra></extra>'
+                ),
+            )
+        )
+        for group in range(1, condition_bins):
+            fig.add_vline(x=group * len(bin_labels) - 0.5, line_color='#555555', line_width=1)
+        fig.update_layout(
+            title=title or f'Factor comparison: {value_label} by {condition_name} regime',
+            template='plotly_white',
+            height=max(520, len(factor_names) * 30 + 220),
+        )
+        fig.update_xaxes(
+            title_text=f'{condition_name} regime / factor percentile bin',
+            tickmode='array',
+            tickvals=column_positions,
+            ticktext=column_labels,
+            tickangle=-45,
+        )
+        fig.update_yaxes(title_text='Tested factor')
+        fig.show()
+
+        columns = pd.MultiIndex.from_product(
+            [regime_labels, bin_labels],
+            names=['condition_regime', 'factor_percentile_bin'],
+        )
+        report = pd.concat(
+            {
+                'mean': pd.DataFrame(mean_returns, index=factor_names, columns=columns),
+                'median': pd.DataFrame(median_returns, index=factor_names, columns=columns),
+                'P(ret<0)': pd.DataFrame(neg_ratios, index=factor_names, columns=columns),
+                'mean_factor': pd.DataFrame(mean_factors, index=factor_names, columns=columns),
+                'mean_condition': pd.DataFrame(mean_conditions, index=factor_names, columns=columns),
+                'observations': pd.DataFrame(observations, index=factor_names, columns=columns),
+            },
+            axis=1,
+            names=['metric'],
+        )
+        report.index.name = 'factor'
+        return report
 
     def compare_ma_divergence_by_volatility(
         self,
@@ -1809,11 +2243,24 @@ class TXAnalyzer:
     # =========================================================================
     # Factor diagnostics: price structure and macro markets
     # =========================================================================
-    def indicator_night_price(self, sub_analysis=False):
+    def indicator_night_ret(
+        self,
+        sub_analysis: bool = False,
+        *,
+        return_series: bool = False,
+        percentile: float | None = None,
+        side: str = 'low',
+    ):
+        """Plot or return the prior night-session close versus its 3-day MA divergence."""
+        if sub_analysis and (return_series or percentile is not None):
+            raise ValueError('sub_analysis cannot be used with return_series or percentile')
         df = self.df.copy()
         df['3_ma'] = df['Close_a'].rolling(3).mean()
         df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
         df = df.dropna(subset=['divergence'])
+        result = self._indicator_value(df['divergence'], name='night_ret_divergence', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         if sub_analysis:
             df_l = df.loc[df['divergence'] < 0]
             df_r = df.loc[df['divergence'] >= 0]
@@ -1828,14 +2275,17 @@ class TXAnalyzer:
         df = df.sort_values(by='divergence').reset_index(drop=True)
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'], title='night_price')
+        return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'], title='night_ret')
 
-    def indicator_spread(self, window: int = 5):
+    def indicator_spread(self, window: int = 5, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
         df.dropna(subset=['spread_a'], inplace=True)
         df['next_ret'] = (df['Close_a'].shift(-window) - df['Close_a']) / df['Close_a']
         df['sum_spread'] = df['spread_a'].rolling(window=window).sum()
         df['sum_spread'] = df['sum_spread'].shift(1)
+        result = self._indicator_value(df['sum_spread'], name=f'spread_{window}', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         # df.dropna(subset=['sum_spread'], inplace=True)
         df.sort_values(by='sum_spread', ignore_index=True, inplace=True)
         df['demeaned_daily_ret_a'] = df['next_ret'] - df['next_ret'].mean()
@@ -1845,7 +2295,7 @@ class TXAnalyzer:
         df['cum_daily_ret_a'] = df['next_ret'].cumsum()
         return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='sum_spread', sub_ly=['cum_daily_ret_a'])
 
-    def indicator_weekday_stats(self):
+    def indicator_weekday_stats(self, *, return_series: bool = False):
         """
         統計並繪製每週各交易日 (Mon-Fri) 的平均報酬率
         """
@@ -1853,6 +2303,8 @@ class TXAnalyzer:
         
         df = self.df.copy()
         df['weekday'] = df.index.weekday
+        if return_series:
+            return df['weekday'].rename('weekday')
         
         # Group by weekday
         weekday_stats = df.groupby('weekday')[['daily_ret', 'daily_ret_a']].mean()
@@ -1870,7 +2322,7 @@ class TXAnalyzer:
         )
         fig.show()
 
-    def indicator_US_bond(self, indicator: str, sub_analysis: bool = False):
+    def indicator_US_bond(self, indicator: str, sub_analysis: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         import numpy as np
         temp_df = self.df.copy()
         ind_list = [
@@ -1888,20 +2340,25 @@ class TXAnalyzer:
 
         temp_df['yield_shock'] = temp_df['yield_shock'].shift(3)
 
+        if indicator not in ind_list:
+            raise ValueError(f'unsupported US bond indicator: {indicator}')
+        result = self._indicator_value(temp_df[indicator], name=f'us_bond_{indicator}', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
+
         temp_df['demean_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demean_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
         temp_df['daily_ret_a'] = temp_df['daily_ret_a']
         temp_df['daily_ret'] = temp_df['daily_ret']
 
-        if indicator in ind_list:
-            temp_df = temp_df.sort_values(by=indicator).reset_index(drop=True)
-            temp_df['cum_demean_daily_ret_a'] = temp_df['demean_daily_ret_a'].cumsum()
-            temp_df['cum_demean_daily_ret'] = temp_df['demean_daily_ret'].cumsum()
-            temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
-            temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
-            return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'us_bond_{indicator}')
+        temp_df = temp_df.sort_values(by=indicator).reset_index(drop=True)
+        temp_df['cum_demean_daily_ret_a'] = temp_df['demean_daily_ret_a'].cumsum()
+        temp_df['cum_demean_daily_ret'] = temp_df['demean_daily_ret'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        return plot.plot(temp_df, ly=['cum_demean_daily_ret_a', 'cum_demean_daily_ret'], ry=indicator, sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'us_bond_{indicator}')
 
-    def indicator_structural_weakness(self):
+    def indicator_structural_weakness(self, *, return_series: bool = False):
         """
         分析「市場結構轉弱」(Structural Weakness) 對績效的影響
         
@@ -1921,6 +2378,8 @@ class TXAnalyzer:
         """
         df = self.df.copy()
         df['weakness'] = (df['Close_a'] < df['Close_a'].shift(2))
+        if return_series:
+            return df['weakness'].rename('structural_weakness')
         df['pos_night'] = np.where(
             df['weakness'].shift(1),
             0,
@@ -1931,10 +2390,8 @@ class TXAnalyzer:
         df['cum_bnh_ret'] = df['daily_ret_a'].cumsum()
         return plot.plot(df, ly=['cum_strat_ret', 'cum_bnh_ret'])
 
-    def indicator_fear_greed(self, trading_session: str, time_series_analysis: bool = False):
+    def indicator_fear_greed(self, trading_session: str, time_series_analysis: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        df.to_csv(OUTPUT_DIR / 'fear_greed_day.csv', index=True)
 
         if trading_session == 'night':
             df['fear_greed'] = df['fear_greed'].shift(1)
@@ -1942,6 +2399,9 @@ class TXAnalyzer:
             df['fear_greed'] = df['fear_greed']
 
         df['delta_fear_greed'] = df['fear_greed'] - df['fear_greed'].shift(1)
+        result = self._indicator_value(df['delta_fear_greed'], name=f'fear_greed_{trading_session}', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
         df.dropna(subset=['daily_ret_a'], inplace=True)
         df['demean_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
@@ -1950,15 +2410,12 @@ class TXAnalyzer:
         df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
         df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        df.to_csv(OUTPUT_DIR / 'fear_greed_night.csv', index=True)
-
         if trading_session == 'night':
             return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='delta_fear_greed', sub_ly=['cum_daily_ret_a'], title='fear_greed_night')
         elif trading_session == 'day':
             return plot.plot(df, ly=['cum_demean_daily_ret'], ry='delta_fear_greed', sub_ly=['cum_daily_ret'], title='fear_greed_day')
 
-    def indicator_move(self, trading_session: str, sub_analysis: bool = False):
+    def indicator_move(self, trading_session: str, sub_analysis: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
         # ====== 計算指標 ======
 
@@ -1971,6 +2428,18 @@ class TXAnalyzer:
         df['MOVE_divergence'] = (df['MOVE_close'] / df['MOVE_ma']) - 1
 
         df['gap'] = (df['Close_a'] / df['Close'].shift(1)) - 1
+
+        if trading_session == 'night':
+            factor = ((df['MOVE_high'] / df['MOVE_low']) - 1).shift(1)
+            factor_name = 'move_vol_night'
+        elif trading_session == 'day':
+            factor = df['ind']
+            factor_name = 'move_return_day'
+        else:
+            raise ValueError("trading_session must be either 'day' or 'night'")
+        result = self._indicator_value(factor, name=factor_name, return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
 
         df['demean_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
@@ -2079,7 +2548,7 @@ class TXAnalyzer:
 
                     print("----------------------------")
 
-    def indicator_sox(self, trading_session: str, sub_analysis: bool = False):
+    def indicator_sox(self, trading_session: str, sub_analysis: bool = False, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
 
         df['ind'] = (df['SOX_close'] / df['SOX_open']) - 1
@@ -2087,6 +2556,11 @@ class TXAnalyzer:
         df['ind'] = df['ind'].shift(1)
         # df['ind'] = (df['SOX_high'] - df['SOX_low']) / df['SOX_close'].shift(1)
         df = df.dropna(subset='ind')
+
+        factor = df['ind'].shift(1) if trading_session == 'night' else df['ind']
+        result = self._indicator_value(factor, name=f'sox_{trading_session}', return_series=return_series, percentile=percentile, side=side)
+        if result is not None:
+            return result
 
         df['gap'] = (df['Open'] / df['Close'].shift(1)) - 1
 
