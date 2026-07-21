@@ -1318,6 +1318,7 @@ class TXAnalyzer:
         windows: range | list[int] | tuple[int, ...],
         *,
         return_column: str = 'daily_ret',
+        volatility_return_column: str = 'daily_ret',
         volatility_window: int = 20,
         volatility_windows: range | list[int] | tuple[int, ...] | None = None,
         vary: str = 'ma',
@@ -1330,13 +1331,17 @@ class TXAnalyzer:
         ``volatility_window``. With ``vary='volatility'``, pass one MA window
         in ``windows`` and the volatility parameters in ``volatility_windows``.
         Columns are volatility regimes, each split into divergence-percentile
-        bins ranked within that regime. Volatility uses preceding returns only.
+        bins ranked within that regime. ``return_column`` is the outcome being
+        measured; ``volatility_return_column`` supplies the preceding returns
+        used to define the volatility regimes.
         """
         windows = list(windows)
         if not windows or any(window < 2 for window in windows):
             raise ValueError('windows must contain moving-average lengths of at least 2')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
+        if volatility_return_column not in self.df:
+            raise KeyError(f"missing volatility return column: {volatility_return_column}")
         if volatility_window < 2:
             raise ValueError('volatility_window must be at least 2')
         if volatility_bins < 2:
@@ -1360,11 +1365,12 @@ class TXAnalyzer:
             row_label = 'Volatility window'
 
         returns = self.df[return_column]
+        volatility_returns = self.df[volatility_return_column]
         volatility_frames: dict[int, pd.DataFrame] = {}
 
         def volatility_frame_for(window: int) -> pd.DataFrame:
             if window not in volatility_frames:
-                realized_volatility = returns.rolling(window).std().shift(1)
+                realized_volatility = volatility_returns.rolling(window).std().shift(1)
                 frame = pd.DataFrame({'return': returns, 'volatility': realized_volatility}).dropna()
                 frame['volatility_group'] = pd.qcut(frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
                 if frame['volatility_group'].nunique() != volatility_bins:
@@ -1410,7 +1416,7 @@ class TXAnalyzer:
                 y=row_values,
                 z=mean_returns,
                 customdata=customdata,
-                text=np.tile(column_labels, (len(windows), 1)),
+                text=np.tile(column_labels, (len(row_values), 1)),
                 colorscale='RdBu',
                 zmid=0,
                 xgap=1,
@@ -1419,8 +1425,8 @@ class TXAnalyzer:
                 hovertemplate=(
                     f'{row_label}: %{{y}}<br>%{{text}}<br>'
                     'Mean raw divergence: %{customdata[0]:.4%}<br>'
-                    'Mean daily return: %{z:.3%}<br>'
-                    'Median daily return: %{customdata[2]:.3%}<br>'
+                    f'Mean {return_column}: %{{z:.3%}}<br>'
+                    f'Median {return_column}: %{{customdata[2]:.3%}}<br>'
                     'P(ret < 0): %{customdata[3]:.1%}<br>'
                     'Observations: %{customdata[1]}'
                     '<extra></extra>'
@@ -1430,7 +1436,10 @@ class TXAnalyzer:
         for group in range(1, volatility_bins):
             fig.add_vline(x=group * len(bin_labels) - 0.5, line_color='#555555', line_width=1)
         fig.update_layout(
-            title=f'MA divergence: daily_ret by volatility regime (varying {row_label.lower()}s)',
+            title=(
+                f'MA divergence: {return_column} by {volatility_return_column} '
+                f'volatility regime (varying {row_label.lower()}s)'
+            ),
             template='plotly_white',
             height=max(650, len(row_values) * 18 + 220),
         )
@@ -1466,11 +1475,14 @@ class TXAnalyzer:
         volatility_bins: int = 5,
         divergence_percentile: float | tuple[float, float] = 15,
         return_column: str = 'daily_ret',
+        volatility_return_column: str = 'daily_ret',
     ) -> pd.DataFrame:
         """Plot when a selected divergence condition occurs over time.
 
         The divergence percentile is ranked within each volatility regime, the
-        same convention used by ``compare_ma_divergence_by_volatility``. Set
+        same convention used by ``compare_ma_divergence_by_volatility``.
+        ``volatility_return_column`` supplies the return series used to form
+        volatility regimes. Set
         ``volatility_bins=1`` to skip the volatility condition and rank across
         all valid dates. Pass ``divergence_percentile=(80, 100)`` to select a
         closed percentile range instead of the default lower-tail cutoff. The
@@ -1482,6 +1494,8 @@ class TXAnalyzer:
             raise ValueError('ma_window must be at least 2')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
+        if volatility_bins > 1 and volatility_return_column not in self.df:
+            raise KeyError(f"missing volatility return column: {volatility_return_column}")
         if volatility_bins < 1:
             raise ValueError('volatility_bins must be at least 1')
         if volatility_bins > 1 and volatility_window < 2:
@@ -1503,22 +1517,23 @@ class TXAnalyzer:
             percentile_label = f'<= {percentile_upper:g}%'
 
         returns = self.df[return_column]
+        return_label = return_column
         divergence = ((self.df['Close'] / self.df['Close'].rolling(ma_window).mean()) - 1).shift(1)
         if volatility_bins == 1:
             frame = pd.DataFrame({'divergence': divergence, 'return': returns}).dropna()
             frame['volatility_group'] = 0
             regime_label = 'without volatility regime'
             customdata = np.column_stack((frame['divergence'],))
-            hovertemplate = 'Date: %{x|%Y-%m-%d}<br>daily_ret: %{y:.3%}<br>Raw divergence: %{customdata[0]:.4%}<br>Divergence percentile: %{text:.1f}%<extra></extra>'
+            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>Raw divergence: %{{customdata[0]:.4%}}<br>Divergence percentile: %{{text:.1f}}%<extra></extra>'
         else:
-            realized_volatility = returns.rolling(volatility_window).std().shift(1)
+            realized_volatility = self.df[volatility_return_column].rolling(volatility_window).std().shift(1)
             frame = pd.DataFrame({'divergence': divergence, 'return': returns, 'volatility': realized_volatility}).dropna()
             frame['volatility_group'] = pd.qcut(frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
             if frame['volatility_group'].nunique() != volatility_bins:
                 raise ValueError(f'not enough volatility variation to create {volatility_bins} bins')
-            regime_label = f'within Q{volatility_regime} volatility ({volatility_window}D)'
+            regime_label = f'within Q{volatility_regime} {volatility_return_column} volatility ({volatility_window}D)'
             customdata = np.column_stack((frame['divergence'], frame['volatility']))
-            hovertemplate = 'Date: %{x|%Y-%m-%d}<br>daily_ret: %{y:.3%}<br>Raw divergence: %{customdata[0]:.4%}<br>Divergence percentile in regime: %{text:.1f}%<br>Prior volatility: %{customdata[1]:.3%}<extra></extra>'
+            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>Raw divergence: %{{customdata[0]:.4%}}<br>Divergence percentile in regime: %{{text:.1f}}%<br>Prior {volatility_return_column} volatility: %{{customdata[1]:.3%}}<extra></extra>'
 
         frame['divergence_percentile'] = frame.groupby('volatility_group')['divergence'].rank(method='first', pct=True) * 100
         events = frame.loc[
@@ -1542,7 +1557,7 @@ class TXAnalyzer:
             shared_xaxes=True,
             row_heights=[0.68, 0.32],
             vertical_spacing=0.1,
-            subplot_titles=['Signal-day daily_ret', 'Signal count by month'],
+            subplot_titles=[f'Signal-day {return_column}', 'Signal count by month'],
         )
         fig.add_trace(
             go.Scatter(
@@ -1555,7 +1570,7 @@ class TXAnalyzer:
                     colorscale='RdBu',
                     cmin=-color_limit,
                     cmax=color_limit,
-                    colorbar=dict(title='daily_ret', tickformat='.1%'),
+                    colorbar=dict(title=return_column, tickformat='.1%'),
                     line=dict(color='#222222', width=0.4),
                 ),
                 customdata=customdata[frame.index.get_indexer(events.index)],
@@ -1590,7 +1605,7 @@ class TXAnalyzer:
             template='plotly_white',
             height=700,
         )
-        fig.update_yaxes(title_text='daily_ret', tickformat='.2%', row=1, col=1)
+        fig.update_yaxes(title_text=return_column, tickformat='.2%', row=1, col=1)
         fig.update_yaxes(title_text='Signal days', row=2, col=1)
         fig.update_xaxes(title_text='Date', row=2, col=1)
         fig.show()
@@ -1601,6 +1616,7 @@ class TXAnalyzer:
         signal_configs: list[dict[str, int | float]],
         *,
         return_column: str = 'daily_ret',
+        volatility_return_column: str = 'daily_ret',
     ) -> pd.DataFrame:
         """Show date overlap across complete divergence/volatility signal settings.
 
@@ -1615,6 +1631,8 @@ class TXAnalyzer:
             raise ValueError('signal_configs must contain at least two configurations')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
+        if volatility_return_column not in self.df:
+            raise KeyError(f"missing volatility return column: {volatility_return_column}")
 
         signals = pd.DataFrame(index=self.df.index)
         details = pd.DataFrame(index=self.df.index)
@@ -1640,7 +1658,7 @@ class TXAnalyzer:
                 raise ValueError('divergence_percentile must be greater than 0 and at most 100')
 
             divergence = ((self.df['Close'] / self.df['Close'].rolling(config['ma_window']).mean()) - 1).shift(1)
-            volatility = self.df[return_column].rolling(config['volatility_window']).std().shift(1)
+            volatility = self.df[volatility_return_column].rolling(config['volatility_window']).std().shift(1)
             frame = pd.DataFrame({'divergence': divergence, 'volatility': volatility}).dropna()
             frame['volatility_group'] = pd.qcut(frame['volatility'], q=config['volatility_bins'], labels=False, duplicates='drop')
             if frame['volatility_group'].nunique() != config['volatility_bins']:
