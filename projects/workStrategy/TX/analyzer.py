@@ -1095,6 +1095,39 @@ class TXAnalyzer:
 
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='TotalExchangeMarginMaintenance', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title='margin_maintenance_rate')
 
+    def indicator_margin_utilization(self, *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
+        """Analyze the prior day's cross-sectional mean margin utilization."""
+        column = 'MarginUtilization'
+        if column not in self.df.columns:
+            raise ValueError(f"{column} is not in the DataFrame.")
+
+        temp_df = self.df.copy()
+        temp_df[column] = temp_df[column].shift(1)
+        result = self._indicator_value(
+            temp_df[column],
+            name='margin_utilization',
+            return_series=return_series,
+            percentile=percentile,
+            side=side,
+        )
+        if result is not None:
+            return result
+
+        temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
+        temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
+        temp_df = temp_df.sort_values(by=column).reset_index(drop=True)
+        temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
+        temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
+        temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
+        temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
+        return plot.plot(
+            temp_df,
+            ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'],
+            ry=column,
+            sub_ly=['cum_daily_ret_a', 'cum_daily_ret'],
+            title='margin_utilization',
+        )
+
     def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = 'day', *, return_series: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
         if trading_session == 'day':
@@ -1454,123 +1487,11 @@ class TXAnalyzer:
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
         return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='hist_vol', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}d_hist_vol')
 
-    def compare_ma_divergence_windows(
-        self,
-        windows: range | list[int] | tuple[int, ...],
-        *,
-        return_column: str = 'daily_ret',
-        demean_return: bool = True,
-        threshold_map: dict[int, float] | None = None,
-        bin_percentile: float = 5,
-    ) -> pd.DataFrame:
-        """Show divergence-sorted daily returns in one heatmap.
-
-        Each row is one MA window. Each cell is the mean return in a
-        divergence-percentile bin. Set ``demean_return=False`` for raw returns.
-        Hover to read the raw divergence at any cell. Pass manually observed
-        thresholds in ``threshold_map`` to mark them in red.
-        """
-
-        windows = list(windows)
-        if not windows or any(window < 2 for window in windows):
-            raise ValueError('windows must contain moving-average lengths of at least 2')
-        if return_column not in self.df:
-            raise KeyError(f"missing return column: {return_column}")
-        if not 0 < bin_percentile <= 25:
-            raise ValueError('bin_percentile must be greater than 0 and at most 25')
-
-        threshold_map = threshold_map or {}
-        analysis_return = self.df[return_column].copy()
-
-        value_label = f'Demeaned {return_column}' if demean_return else return_column
-        value_title = value_label.replace(' ', '_')
-        summary = []
-        heatmap_values = []
-        heatmap_divergence = []
-        bin_edges = np.append(np.arange(0, 100, bin_percentile), 100.0)
-        percentiles = (bin_edges[:-1] + bin_edges[1:]) / 2
-        bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
-        fig = go.Figure()
-
-        for window in windows:
-            divergence = ((self.df['Close'] / self.df['Close'].rolling(window=window).mean()) - 1).shift(1)
-            frame = pd.DataFrame({'divergence': divergence, 'return': analysis_return}).dropna()
-            if frame.empty:
-                summary.append({'window': window, 'observations': 0, 'minimum_return': np.nan, 'divergence_at_minimum': np.nan})
-                heatmap_values.append(np.full(len(percentiles), np.nan))
-                heatmap_divergence.append(np.full(len(percentiles), np.nan))
-                continue
-
-            frame = frame.sort_values('divergence').reset_index(drop=True)
-            frame['display_return'] = frame['return'] - frame['return'].mean() if demean_return else frame['return']
-            frame['divergence_percentile'] = (np.arange(len(frame)) + 1) / len(frame) * 100
-            bin_means = []
-            bin_divergence = []
-            for lower, upper in zip(bin_edges[:-1], bin_edges[1:]):
-                values = frame.loc[(frame['divergence_percentile'] > lower) & (frame['divergence_percentile'] <= upper)]
-                bin_means.append(values['display_return'].mean())
-                bin_divergence.append(values['divergence'].mean())
-            heatmap_values.append(bin_means)
-            heatmap_divergence.append(bin_divergence)
-            minimum = frame.loc[frame['display_return'].idxmin()]
-            summary.append({
-                'window': window,
-                'observations': len(frame),
-                'minimum_return': minimum['display_return'],
-                'divergence_at_minimum': minimum['divergence'],
-            })
-
-        fig.add_trace(
-            go.Heatmap(
-                x=percentiles,
-                y=windows,
-                z=np.asarray(heatmap_values),
-                customdata=np.asarray(heatmap_divergence),
-                text=np.tile(bin_labels, (len(windows), 1)),
-                colorscale='RdBu',
-                zmid=0,
-                colorbar=dict(title=value_title.replace('_', '<br>', 1), tickformat='.1%'),
-                hovertemplate=f'MA window: %{{y}}<br>Divergence percentile bin: %{{text}}<br>Raw divergence: %{{customdata:.4%}}<br>{value_title}: %{{z:.3%}}<extra></extra>',
-            )
-        )
-        marker_x = []
-        marker_y = []
-        marker_text = []
-        for row, window in enumerate(windows):
-            if window not in threshold_map or not np.isfinite(heatmap_divergence[row]).any():
-                continue
-            threshold = threshold_map[window]
-            marker_x.append(np.interp(threshold, heatmap_divergence[row], percentiles))
-            marker_y.append(window)
-            marker_text.append(f'{window} MA threshold: {threshold:.4%}')
-        if marker_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=marker_x,
-                    y=marker_y,
-                    mode='markers',
-                    marker=dict(color='#111111', size=10, symbol='x'),
-                    text=marker_text,
-                    hovertemplate='%{text}<extra></extra>',
-                    name='observed threshold',
-                )
-            )
-        fig.update_layout(
-            title=f'MA divergence: {value_title} heatmap',
-            template='plotly_white',
-            height=620,
-            hovermode='closest',
-            showlegend=False,
-        )
-        fig.update_xaxes(title_text='Divergence percentile within each MA window', range=[0, 100])
-        fig.update_yaxes(title_text='MA window')
-        fig.show()
-
     def compare_factor_by_condition(
         self,
         factors: dict[str, pd.Series] | pd.Series | str,
         *,
-        condition_factor: pd.Series | str,
+        condition_factor: pd.Series | str | dict[str, pd.Series | str],
         return_column: str = 'daily_ret',
         condition_bins: int = 5,
         factor_bin_percentile: float = 20,
@@ -1584,7 +1505,8 @@ class TXAnalyzer:
 
         ``factors`` is either one series/column name or a mapping from display
         names to factor series. ``condition_factor`` is split into quantile
-        regimes; inside every regime each tested factor is ranked and split
+        regimes; it can also be a mapping keyed like ``factors`` when each row
+        needs a different condition series. Inside every regime each tested factor is ranked and split
         into percentile bins. This is useful for questions such as: "within
         each volatility regime, how does fear/greed relate to next-day return?"
 
@@ -1621,31 +1543,21 @@ class TXAnalyzer:
             series, name = resolve_factor(factors, 'factor')
             resolved_factors = {name: series}
 
-        condition_series, default_condition_name = resolve_factor(condition_factor, 'condition')
+        if isinstance(condition_factor, dict):
+            if set(condition_factor) != set(resolved_factors):
+                raise ValueError('condition factor mapping keys must exactly match factors keys')
+            resolved_conditions = {
+                name: resolve_factor(series, f'{name} condition')[0]
+                for name, series in condition_factor.items()
+            }
+            default_condition_name = 'condition'
+        else:
+            condition_series, default_condition_name = resolve_factor(condition_factor, 'condition')
+            resolved_conditions = {name: condition_series for name in resolved_factors}
         condition_name = condition_name or default_condition_name
-        base = pd.DataFrame({
-            'return': self.df[return_column],
-            'condition': condition_series,
-        }).dropna()
-        if base.empty:
-            raise ValueError('no overlapping non-null observations are available for return and condition factor')
         if condition_bins == 1:
-            base['condition_group'] = 0
             regime_labels = ['all observations']
         else:
-            try:
-                base['condition_group'] = pd.qcut(
-                    base['condition'],
-                    q=condition_bins,
-                    labels=False,
-                    duplicates='raise',
-                )
-            except ValueError as error:
-                raise ValueError(
-                    f'condition factor cannot be split into {condition_bins} bins: {condition_name}'
-                ) from error
-            if base['condition_group'].nunique() != condition_bins:
-                raise ValueError(f'condition factor cannot create {condition_bins} non-empty bins: {condition_name}')
             regime_labels = [f'Q{group + 1}' for group in range(condition_bins)]
             regime_labels[0] += ' low'
             regime_labels[-1] += ' high'
@@ -1654,6 +1566,20 @@ class TXAnalyzer:
         bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
         column_labels = [f'{regime}\n{bin_label}' for regime in regime_labels for bin_label in bin_labels]
         factor_names = list(resolved_factors)
+        ma_suffix = 'MA divergence'
+        display_factor_names = [
+            name[:-len(ma_suffix)].strip()
+            if name.endswith(ma_suffix) and name[:-len(ma_suffix)].strip().isdigit()
+            else name
+            for name in factor_names
+        ]
+        if len(factor_names) == 1:
+            display_factor_names = ['']
+            y_axis_title = factor_names[0]
+        elif display_factor_names != factor_names and all(name.isdigit() for name in display_factor_names):
+            y_axis_title = 'MA window'
+        else:
+            y_axis_title = 'Tested factor'
         mean_returns = np.full((len(factor_names), len(column_labels)), np.nan)
         median_returns = np.full((len(factor_names), len(column_labels)), np.nan)
         neg_ratios = np.full((len(factor_names), len(column_labels)), np.nan)
@@ -1662,9 +1588,31 @@ class TXAnalyzer:
         observations = np.zeros((len(factor_names), len(column_labels)), dtype=int)
 
         for row, (factor_name, factor_series) in enumerate(resolved_factors.items()):
-            frame = base.join(factor_series.rename('factor')).dropna(subset=['factor']).copy()
+            frame = pd.DataFrame({
+                'return': self.df[return_column],
+                'condition': resolved_conditions[factor_name],
+                'factor': factor_series,
+            }).dropna()
             if frame.empty:
                 continue
+            if condition_bins == 1:
+                frame['condition_group'] = 0
+            else:
+                try:
+                    frame['condition_group'] = pd.qcut(
+                        frame['condition'],
+                        q=condition_bins,
+                        labels=False,
+                        duplicates='raise',
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        f'condition factor cannot be split into {condition_bins} bins for {factor_name}'
+                    ) from error
+                if frame['condition_group'].nunique() != condition_bins:
+                    raise ValueError(
+                        f'condition factor cannot create {condition_bins} non-empty bins for {factor_name}'
+                    )
             frame['display_return'] = frame['return'] - frame['return'].mean() if demean_return else frame['return']
             for group in range(condition_bins):
                 regime = frame.loc[frame['condition_group'].eq(group)].copy()
@@ -1690,7 +1638,7 @@ class TXAnalyzer:
         fig = go.Figure(
             go.Heatmap(
                 x=column_positions,
-                y=factor_names,
+                y=display_factor_names,
                 z=mean_returns,
                 customdata=customdata,
                 text=np.tile(column_labels, (len(factor_names), 1)),
@@ -1700,7 +1648,10 @@ class TXAnalyzer:
                 ygap=1,
                 colorbar=dict(title=f'Mean<br>{value_label}', tickformat='.1%'),
                 hovertemplate=(
-                    'Factor: %{y}<br>%{text}<br>'
+                    f'Factor: {factor_names[0]}<br>%{{text}}<br>'
+                    if len(factor_names) == 1
+                    else 'Factor: %{y}<br>%{text}<br>'
+                ) + (
                     f'Mean raw factor: %{{customdata[0]:{factor_value_format}}}<br>'
                     f'Mean {condition_name}: %{{customdata[1]:{condition_value_format}}}<br>'
                     f'Mean {value_label}: %{{z:.3%}}<br>'
@@ -1725,7 +1676,7 @@ class TXAnalyzer:
             ticktext=column_labels,
             tickangle=-45,
         )
-        fig.update_yaxes(title_text='Tested factor')
+        fig.update_yaxes(title_text=y_axis_title)
         fig.show()
 
         columns = pd.MultiIndex.from_product(
@@ -1747,159 +1698,6 @@ class TXAnalyzer:
         report.index.name = 'factor'
         return report
 
-    def compare_ma_divergence_by_volatility(
-        self,
-        windows: range | list[int] | tuple[int, ...],
-        *,
-        return_column: str = 'daily_ret',
-        volatility_return_column: str = 'daily_ret',
-        volatility_window: int = 20,
-        volatility_windows: range | list[int] | tuple[int, ...] | None = None,
-        vary: str = 'ma',
-        volatility_bins: int = 5,
-        divergence_bin_percentile: float = 20,
-    ) -> pd.DataFrame:
-        """Compare MA or volatility-window parameters across volatility regimes.
-
-        With ``vary='ma'`` (default), rows are MA windows and volatility uses
-        ``volatility_window``. With ``vary='volatility'``, pass one MA window
-        in ``windows`` and the volatility parameters in ``volatility_windows``.
-        Columns are volatility regimes, each split into divergence-percentile
-        bins ranked within that regime. ``return_column`` is the outcome being
-        measured; ``volatility_return_column`` supplies the preceding returns
-        used to define the volatility regimes.
-        """
-        windows = list(windows)
-        if not windows or any(window < 2 for window in windows):
-            raise ValueError('windows must contain moving-average lengths of at least 2')
-        if return_column not in self.df:
-            raise KeyError(f"missing return column: {return_column}")
-        if volatility_return_column not in self.df:
-            raise KeyError(f"missing volatility return column: {volatility_return_column}")
-        if volatility_window < 2:
-            raise ValueError('volatility_window must be at least 2')
-        if volatility_bins < 2:
-            raise ValueError('volatility_bins must be at least 2')
-        if not 0 < divergence_bin_percentile <= 50:
-            raise ValueError('divergence_bin_percentile must be greater than 0 and at most 50')
-        if vary not in {'ma', 'volatility'}:
-            raise ValueError("vary must be either 'ma' or 'volatility'")
-
-        if vary == 'ma':
-            row_values = windows
-            row_label = 'MA window'
-        else:
-            if len(windows) != 1:
-                raise ValueError("vary='volatility' requires exactly one MA window in windows")
-            if volatility_windows is None:
-                raise ValueError("vary='volatility' requires volatility_windows")
-            row_values = list(volatility_windows)
-            if not row_values or any(window < 2 for window in row_values):
-                raise ValueError('volatility_windows must contain window lengths of at least 2')
-            row_label = 'Volatility window'
-
-        returns = self.df[return_column]
-        volatility_returns = self.df[volatility_return_column]
-        volatility_frames: dict[int, pd.DataFrame] = {}
-
-        def volatility_frame_for(window: int) -> pd.DataFrame:
-            if window not in volatility_frames:
-                realized_volatility = volatility_returns.rolling(window).std().shift(1)
-                frame = pd.DataFrame({'return': returns, 'volatility': realized_volatility}).dropna()
-                frame['volatility_group'] = pd.qcut(frame['volatility'], q=volatility_bins, labels=False, duplicates='drop')
-                if frame['volatility_group'].nunique() != volatility_bins:
-                    raise ValueError(f'not enough volatility variation to create {volatility_bins} bins for window={window}')
-                volatility_frames[window] = frame
-            return volatility_frames[window]
-
-        bin_edges = np.append(np.arange(0, 100, divergence_bin_percentile), 100.0)
-        bin_labels = [f'{lower:g}% to {upper:g}%' for lower, upper in zip(bin_edges[:-1], bin_edges[1:])]
-        regime_labels = [f'Q{group + 1}' for group in range(volatility_bins)]
-        regime_labels[0] += ' low vol'
-        regime_labels[-1] += ' high vol'
-        column_labels = [f'{regime}\n{bin_label}' for regime in regime_labels for bin_label in bin_labels]
-        mean_returns = np.full((len(row_values), len(column_labels)), np.nan)
-        median_returns = np.full((len(row_values), len(column_labels)), np.nan)
-        neg_ratios = np.full((len(row_values), len(column_labels)), np.nan)
-        mean_divergence = np.full((len(row_values), len(column_labels)), np.nan)
-        observations = np.zeros((len(row_values), len(column_labels)), dtype=int)
-
-        for row, parameter in enumerate(row_values):
-            ma_window, current_volatility_window = (parameter, volatility_window) if vary == 'ma' else (windows[0], parameter)
-            divergence = ((self.df['Close'] / self.df['Close'].rolling(window=ma_window).mean()) - 1).shift(1)
-            frame = pd.DataFrame({'divergence': divergence}).join(volatility_frame_for(current_volatility_window)).dropna()
-            for group in range(volatility_bins):
-                regime = frame.loc[frame['volatility_group'] == group].copy()
-                if regime.empty:
-                    continue
-                regime['divergence_percentile'] = regime['divergence'].rank(method='first') / len(regime) * 100
-                for bin_index, (lower, upper) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
-                    column = group * len(bin_labels) + bin_index
-                    values = regime.loc[(regime['divergence_percentile'] > lower) & (regime['divergence_percentile'] <= upper)]
-                    mean_returns[row, column] = values['return'].mean()
-                    median_returns[row, column] = values['return'].median()
-                    neg_ratios[row, column] = (values['return'] < 0).mean() if len(values) > 0 else np.nan
-                    mean_divergence[row, column] = values['divergence'].mean()
-                    observations[row, column] = len(values)
-
-        customdata = np.stack((mean_divergence, observations, median_returns, neg_ratios), axis=-1)
-        column_positions = np.arange(len(column_labels))
-        fig = go.Figure(
-            go.Heatmap(
-                x=column_positions,
-                y=row_values,
-                z=mean_returns,
-                customdata=customdata,
-                text=np.tile(column_labels, (len(row_values), 1)),
-                colorscale='RdBu',
-                zmid=0,
-                xgap=1,
-                ygap=1,
-                colorbar=dict(title=f'Mean<br>{return_column}', tickformat='.1%'),
-                hovertemplate=(
-                    f'{row_label}: %{{y}}<br>%{{text}}<br>'
-                    'Mean raw divergence: %{customdata[0]:.4%}<br>'
-                    f'Mean {return_column}: %{{z:.3%}}<br>'
-                    f'Median {return_column}: %{{customdata[2]:.3%}}<br>'
-                    'P(ret < 0): %{customdata[3]:.1%}<br>'
-                    'Observations: %{customdata[1]}'
-                    '<extra></extra>'
-                ),
-            )
-        )
-        for group in range(1, volatility_bins):
-            fig.add_vline(x=group * len(bin_labels) - 0.5, line_color='#555555', line_width=1)
-        fig.update_layout(
-            title=(
-                f'MA divergence: {return_column} by {volatility_return_column} '
-                f'volatility regime (varying {row_label.lower()}s)'
-            ),
-            template='plotly_white',
-            height=max(650, len(row_values) * 18 + 220),
-        )
-        fig.update_xaxes(
-            title_text='Volatility regime / divergence percentile bin',
-            tickmode='array',
-            tickvals=column_positions,
-            ticktext=column_labels,
-            tickangle=-45,
-        )
-        fig.update_yaxes(title_text=row_label)
-        bin_columns = pd.MultiIndex.from_product([regime_labels, bin_labels], names=['volatility_regime', 'divergence_percentile_bin'])
-        fig.show()
-        report = pd.concat(
-            {
-                'mean': pd.DataFrame(mean_returns, index=row_values, columns=bin_columns),
-                'median': pd.DataFrame(median_returns, index=row_values, columns=bin_columns),
-                'P(ret<0)': pd.DataFrame(neg_ratios, index=row_values, columns=bin_columns),
-                'observations': pd.DataFrame(observations, index=row_values, columns=bin_columns),
-            },
-            axis=1,
-            names=['metric'],
-        )
-        report.index.name = row_label.replace(' ', '_').lower()
-        return report
-
     def show_divergence_signal_timeline(
         self,
         *,
@@ -1910,11 +1708,15 @@ class TXAnalyzer:
         divergence_percentile: float | tuple[float, float] = 15,
         return_column: str = 'daily_ret',
         volatility_return_column: str = 'daily_ret',
+        factor: pd.Series | str | None = None,
+        factor_name: str | None = None,
     ) -> pd.DataFrame:
-        """Plot when a selected divergence condition occurs over time.
+        """Plot when a selected factor condition occurs over time.
 
-        The divergence percentile is ranked within each volatility regime, the
-        same convention used by ``compare_ma_divergence_by_volatility``.
+        By default this calculates MA divergence. Pass ``factor`` as a Series
+        (or a column name) to inspect any numeric indicator instead. Its
+        percentile is ranked within each volatility regime, the
+        same convention used by ``compare_factor_by_condition``.
         ``volatility_return_column`` supplies the return series used to form
         volatility regimes. Set
         ``volatility_bins=1`` to skip the volatility condition and rank across
@@ -1924,7 +1726,7 @@ class TXAnalyzer:
         """
         from plotly.subplots import make_subplots
 
-        if ma_window < 2:
+        if factor is None and ma_window < 2:
             raise ValueError('ma_window must be at least 2')
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
@@ -1950,15 +1752,25 @@ class TXAnalyzer:
                 raise ValueError('divergence_percentile must be greater than 0 and at most 100')
             percentile_label = f'<= {percentile_upper:g}%'
 
+        if isinstance(factor, str):
+            if factor not in self.df:
+                raise KeyError(f'missing factor column: {factor}')
+            factor_series = self.df[factor]
+        elif factor is None:
+            factor_series = ((self.df['Close'] / self.df['Close'].rolling(ma_window).mean()) - 1).shift(1)
+        else:
+            factor_series = pd.Series(factor).copy()
+        factor_label = factor_name or (factor_series.name if factor_series.name else f'{ma_window}MA divergence')
+
         returns = self.df[return_column]
         return_label = return_column
-        divergence = ((self.df['Close'] / self.df['Close'].rolling(ma_window).mean()) - 1).shift(1)
+        divergence = factor_series
         if volatility_bins == 1:
             frame = pd.DataFrame({'divergence': divergence, 'return': returns}).dropna()
             frame['volatility_group'] = 0
             regime_label = 'without volatility regime'
             customdata = np.column_stack((frame['divergence'],))
-            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>Raw divergence: %{{customdata[0]:.4%}}<br>Divergence percentile: %{{text:.1f}}%<extra></extra>'
+            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>{factor_label}: %{{customdata[0]:.4%}}<br>Factor percentile: %{{text:.1f}}%<extra></extra>'
         else:
             realized_volatility = self.df[volatility_return_column].rolling(volatility_window).std().shift(1)
             frame = pd.DataFrame({'divergence': divergence, 'return': returns, 'volatility': realized_volatility}).dropna()
@@ -1967,7 +1779,7 @@ class TXAnalyzer:
                 raise ValueError(f'not enough volatility variation to create {volatility_bins} bins')
             regime_label = f'within Q{volatility_regime} {volatility_return_column} volatility ({volatility_window}D)'
             customdata = np.column_stack((frame['divergence'], frame['volatility']))
-            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>Raw divergence: %{{customdata[0]:.4%}}<br>Divergence percentile in regime: %{{text:.1f}}%<br>Prior {volatility_return_column} volatility: %{{customdata[1]:.3%}}<extra></extra>'
+            hovertemplate = f'Date: %{{x|%Y-%m-%d}}<br>{return_label}: %{{y:.3%}}<br>{factor_label}: %{{customdata[0]:.4%}}<br>Factor percentile in regime: %{{text:.1f}}%<br>Prior {volatility_return_column} volatility: %{{customdata[1]:.3%}}<extra></extra>'
 
         frame['divergence_percentile'] = frame.groupby('volatility_group')['divergence'].rank(method='first', pct=True) * 100
         events = frame.loc[
@@ -2032,7 +1844,7 @@ class TXAnalyzer:
         max_gap_text = 'n/a' if pd.isna(max_gap) else f'{max_gap:.0f} days'
         fig.update_layout(
             title=(
-                f'{ma_window}ma divergence {percentile_label} {regime_label}: '
+                f'{factor_label} {percentile_label} {regime_label}: '
                 f'{len(events)} signal days | active months {active_months}/{len(monthly_count)} '
                 f'| median gap {gap_text} | max gap {max_gap_text}'
             ),
