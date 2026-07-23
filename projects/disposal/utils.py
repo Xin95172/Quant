@@ -117,9 +117,9 @@ def process_disposal_events(disposal_info):
     
     return events
 
-def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offset_days=3):
+def filter_price_range(price_df, stock_id, start_dates, end_dates, offset_days=3):
     """
-    針對單檔股票，抓取並篩選出落在 [Start-Offset, End+Offset] 區間內的股價。
+    針對單檔股票，從共用日線資料篩選 [Start-Offset, End+Offset] 區間。
     支援多個處置區間（取聯集）。
     """
     if start_dates.empty or end_dates.empty:
@@ -147,34 +147,24 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
     if start_dates.empty or end_dates.empty:
         return None
 
-    global_min = start_dates.min() - timedelta(days=safe_buffer)
-    global_max = end_dates.max() + timedelta(days=safe_buffer)
-    
-    start_str = global_min.strftime('%Y-%m-%d')
-    end_str = global_max.strftime('%Y-%m-%d')
-    
     try:
-        # Wrap API call to catch FinMind's KeyError: 'data'
-        try:
-            client.initialize_frame(stock_id=stock_id, start_time=start_str, end_time=end_str)
-            price_df = client.get_stock()
-        except KeyError:
-            # FinMind returns KeyError 'data' if no data found or API error (Token/Limit)
-            print(f"[Warning] FinMind API returned no data for {stock_id}. This usually indicates an INVALID TOKEN or RATE LIMIT reached.")
+        stock_column = 'Stock_id' if 'Stock_id' in price_df.columns else 'stock_id'
+        date_column = 'Date' if 'Date' in price_df.columns else 'date'
+        price_df = price_df.loc[
+            price_df[stock_column].astype(str).eq(str(stock_id))
+        ].copy()
+        if price_df.empty:
             return None
-        except Exception:
-            # Other API errors
-            return None
-        
-        if price_df is None or price_df.empty:
-            return None
-            
-        if 'Date' not in price_df.columns:
-            price_df = price_df.reset_index() # Ensure Date is a column
-        
-        if 'Date' not in price_df.columns:
-            # Should not happen if API is correct, but safe guard
-            return None
+
+        price_df = price_df.rename(columns={
+            stock_column: 'Stock_id',
+            date_column: 'Date',
+            'open': 'Open',
+            'max': 'High',
+            'min': 'Low',
+            'close': 'Close',
+            'Trading_Volume': 'Volume',
+        })
 
         # [Fix] Strict conversion to datetime64[ns] to avoid int vs Timestamp comparison
         price_df['Date'] = pd.to_datetime(price_df['Date'], errors='coerce')
@@ -196,8 +186,6 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
 
         # [Fix] Ensure numpy array is strictly datetime64[ns]
         dates_in_df = price_df['Date'].values.astype('datetime64[ns]')
-        trading_indices = price_df['trading_idx'].values
-        
         # 2. 建立精確篩選遮罩 (Mask)
         # 用戶要求：確定抓到的是「實際交易日」 (offset_days 代表交易日數)
         mask = pd.Series(False, index=price_df.index)
@@ -248,17 +236,12 @@ def fetch_and_filter_price_range(client, stock_id, start_dates, end_dates, offse
         print(traceback.format_exc()) 
         return None
 
-def _fetch_worker_range(stock_id, start_dates, end_dates, offset_days, token=None):
-    from module.get_info_FinMind import FinMindClient
-    # Create a new local client for thread safety
-    local_client = FinMindClient()
-    if token:
-        local_client.login_by_token(token)
-    return fetch_and_filter_price_range(local_client, stock_id, start_dates, end_dates, offset_days)
+def _filter_worker_range(price_df, stock_id, start_dates, end_dates, offset_days):
+    return filter_price_range(price_df, stock_id, start_dates, end_dates, offset_days)
 
-def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
+def load_price_ranges(price_file, disposal_info, offset_days=3, max_workers=8):
     """
-    使用多執行緒平行抓取所有股票的價格資料。
+    從共用 parquet 讀取日線，並平行篩選所有股票的事件區間。
     支援 Finlab 資料格式 (自動偵測 '處置開始時間' 與 '處置結束時間')。
     """
     # Ensure it's a standard pandas DataFrame (dissociate from Finlab objects)
@@ -273,7 +256,7 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
         if 'stock_id' in disposal_events.columns:
              disposal_events = disposal_events.rename(columns={'stock_id': 'Stock_id'})
              
-    token = client.config.api_token if hasattr(client, 'config') else None
+    price_df = pd.read_parquet(price_file)
 
     # 欄位偵測
     # 欄位偵測 (優先使用標準化欄位)
@@ -298,7 +281,7 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
         print("Error: Required date columns not found.")
         return pd.DataFrame()
     
-    print(f"Starting batch fetch for {len(unique_stocks)} stocks with {max_workers} workers...")
+    print(f"Filtering {len(unique_stocks)} stocks with {max_workers} workers...")
     
     all_prices = []
     
@@ -309,10 +292,17 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
             starts = pd.to_datetime(subset[col_start])
             ends = pd.to_datetime(subset[col_end])
             
-            future = executor.submit(_fetch_worker_range, stock_id, starts, ends, offset_days, token)
+            future = executor.submit(
+                _filter_worker_range,
+                price_df,
+                stock_id,
+                starts,
+                ends,
+                offset_days,
+            )
             future_to_stock[future] = stock_id
             
-        for future in tqdm(as_completed(future_to_stock), total=len(unique_stocks), desc="Fetching Prices"):
+        for future in tqdm(as_completed(future_to_stock), total=len(unique_stocks), desc="Filtering Prices"):
             stock_id = future_to_stock[future]
             try:
                 result_df = future.result()
@@ -323,10 +313,10 @@ def batch_fetch_prices(client, disposal_info, offset_days=3, max_workers=8):
     
     if all_prices:
         final_df = pd.concat(all_prices).drop_duplicates()
-        print(f"Fetched total {len(final_df)} rows.")
+        print(f"Selected total {len(final_df)} rows.")
         return final_df
     else:
-        print("No data fetched.")
+        print("No matching local data found.")
         return pd.DataFrame()
 
 def run_event_study(price_df, disposal_info, offset_days=3):
